@@ -1,0 +1,9 @@
+node_modules/
+coverage/
+.env*
+!.env.example
+.sumi/
+state.json
+audit.jsonl
+*.tmp
+*.log

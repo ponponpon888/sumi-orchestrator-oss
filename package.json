@@ -1,0 +1,18 @@
+{
+  "name": "sumi-orchestrator",
+  "version": "1.14.3",
+  "private": true,
+  "description": "Development state orchestrator for AI-assisted software projects.",
+  "type": "module",
+  "bin": {
+    "sumi": "./src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/cli.js && node --check src/store.js && node --check src/domain.js && node --check src/sync.js && node --check src/handoff.js && node --check src/format.js && node --check src/next.js && node --check src/scope.js && node --check src/router.js && node --check src/result.js && node --check src/ledger.js && node --check src/recovery.js && node --check src/dispatch.js && node --check src/browser.js && node --check src/continue.js && node --check src/queue.js && node --check src/batch.js && node --check src/claims.js && node --check src/sessions.js && node --check src/review.js && node --check src/reviewer.js && node --check src/merge.js && node --check src/release.js && node --check src/delivery.js && node --check src/releases.js",
+    "demo": "node src/cli.js --data ./examples/demo-state.json dashboard"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
