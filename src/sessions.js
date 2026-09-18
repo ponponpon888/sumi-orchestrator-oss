@@ -6,9 +6,10 @@ import { ensureProjectShape, touch } from "./domain.js";
 import { claimScopeCriterion, getActiveClaim, releaseScopeClaim } from "./claims.js";
 import { buildAgentPrompt, getRoutePlan } from "./router.js";
 import { analyzeAgentResult, applyAgentResult, formatAgentResultAnalysis, recordAgentResult } from "./result.js";
+import { AGENT_IDS, CODE_AGENT_IDS } from "./adapters.js";
 
-const SESSION_AGENTS = new Set(["codex", "claude-code", "browser", "human"]);
-const CODE_AGENTS = new Set(["codex", "claude-code"]);
+const SESSION_AGENTS = new Set(AGENT_IDS);
+const CODE_AGENTS = new Set(CODE_AGENT_IDS);
 const ACTIVE_STATUS = "active";
 
 function asDate(value) {

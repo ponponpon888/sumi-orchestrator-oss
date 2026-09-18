@@ -198,6 +198,8 @@ SUMI currently distinguishes work such as:
 - `browser / verify` — runtime/browser verification
 - `human / action` — billing, permissions, account-owner actions
 
+These agents are defined in one capability registry. Codex is currently the only automatic CLI adapter and is restricted to read-only review mode. Claude Code is registered as write-capable and isolation-required, so direct dispatch remains manual until execution is confined to a SUMI session worktree.
+
 Dependency-gated work is shown as `WAITING` rather than repeatedly re-dispatched.
 
 Generate an assignment prompt:
@@ -621,7 +623,7 @@ npm run check
 Current v1 validation target:
 
 ```text
-234 tests passing
+239 tests passing
 syntax checks passing
 ```
 

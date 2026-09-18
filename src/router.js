@@ -1,8 +1,9 @@
 import { buildNextQueue, classifyAction, effectiveScopeStatus, remediationDependencies } from "./next.js";
 import { getActiveClaim } from "./claims.js";
 import { getServiceState } from "./domain.js";
+import { AGENT_IDS } from "./adapters.js";
 
-export const AGENTS = new Set(["claude-code", "codex", "browser", "human"]);
+export const AGENTS = new Set(AGENT_IDS);
 
 function stripScopePrefix(text) {
   return String(text || "").replace(/^(C\d{3})\s+/, "").trim();

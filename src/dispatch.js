@@ -4,6 +4,7 @@ import { buildSpawnInvocation, chooseResolvedCommand } from "./sync.js";
 import { buildAgentPrompt, getRoutePlan, selectRouteItem } from "./router.js";
 import { analyzeAgentResult, applyAgentResult, recordAgentResult } from "./result.js";
 import { touch } from "./domain.js";
+import { getAgentAdapter, isAutomaticAdapter } from "./adapters.js";
 
 const commandPathCache = new Map();
 
@@ -124,25 +125,17 @@ export function prepareDispatch(project, selector) {
   const plan = getRoutePlan(project);
   const item = selectRouteItem(plan, selector);
   const prompt = buildAgentPrompt(project, item);
+  const adapter = getAgentAdapter(item.agent);
   if (item.state !== "ready") {
-    return { executable: false, reason: item.reason || "Route item is waiting.", item, prompt };
+    return { executable: false, reason: item.reason || "Route item is waiting.", adapter, item, prompt };
   }
-  if (item.agent === "human" || item.agent === "browser") {
-    return { executable: false, manual: true, reason: `${item.agent} routes require an external/manual action; SUMI records the handoff instead of auto-executing it.`, item, prompt };
+  if (!adapter) {
+    return { executable: false, manual: true, reason: `No registered adapter for agent: ${item.agent}`, adapter: null, item, prompt };
   }
-  if (item.agent === "claude-code") {
-    return {
-      executable: false,
-      manual: true,
-      reason: "Claude Code write-capable dispatch is intentionally not automated; use the generated prompt or an explicitly approved write-capable adapter.",
-      item,
-      prompt
-    };
+  if (!isAutomaticAdapter(adapter, item.mode)) {
+    return { executable: false, manual: true, reason: adapter.manualReason, adapter, item, prompt };
   }
-  if (item.agent !== "codex") {
-    return { executable: false, manual: true, reason: `No automatic adapter for agent: ${item.agent}`, item, prompt };
-  }
-  return { executable: true, item, prompt };
+  return { executable: true, adapter, item, prompt };
 }
 
 export async function dispatchProject(project, selector, { apply = false, runner = null } = {}) {
@@ -155,6 +148,8 @@ export async function dispatchProject(project, selector, { apply = false, runner
       ...meta,
       scopeId: prepared.item.scopeId,
       agent: prepared.item.agent,
+      adapter: prepared.adapter?.id || null,
+      capability: prepared.adapter?.capability || null,
       mode: prepared.item.mode,
       state: prepared.item.state,
       status: prepared.manual ? "manual" : "waiting",
@@ -172,7 +167,7 @@ export async function dispatchProject(project, selector, { apply = false, runner
   if (runner) {
     execution = await runner({ project, item: prepared.item, prompt: prepared.prompt });
   } else {
-    const resolved = resolveCommand("codex");
+    const resolved = resolveCommand(prepared.adapter.command);
     if (!resolved) throw new Error("Codex CLI not found. Install/login to Codex CLI or use `sumi route ... --prompt ...` manually.");
     if (!project.local || !fs.existsSync(project.local)) throw new Error(`Registered local repository does not exist: ${project.local || "—"}`);
 
@@ -190,6 +185,8 @@ export async function dispatchProject(project, selector, { apply = false, runner
       ...meta,
       scopeId: prepared.item.scopeId,
       agent: prepared.item.agent,
+      adapter: prepared.adapter?.id || null,
+      capability: prepared.adapter?.capability || null,
       mode: prepared.item.mode,
       state: prepared.item.state,
       status: "failed",
@@ -209,6 +206,8 @@ export async function dispatchProject(project, selector, { apply = false, runner
       ...meta,
       scopeId: prepared.item.scopeId,
       agent: prepared.item.agent,
+      adapter: prepared.adapter?.id || null,
+      capability: prepared.adapter?.capability || null,
       mode: prepared.item.mode,
       state: prepared.item.state,
       status: "failed",
@@ -236,6 +235,8 @@ export async function dispatchProject(project, selector, { apply = false, runner
     ...meta,
     scopeId: prepared.item.scopeId,
     agent: prepared.item.agent,
+    adapter: prepared.adapter?.id || null,
+    capability: prepared.adapter?.capability || null,
     mode: prepared.item.mode,
     state: prepared.item.state,
     status: "completed",
@@ -249,12 +250,19 @@ export async function dispatchProject(project, selector, { apply = false, runner
   return { ...prepared, dispatch: record, execution, result, analysis, applied };
 }
 
+function preparedAdapterLabel(outcome) {
+  const adapter = outcome.adapter;
+  if (!adapter) return "unregistered";
+  return `${adapter.id} / ${adapter.capability} / ${isAutomaticAdapter(adapter, outcome.item?.mode) ? "automatic" : "manual"}`;
+}
+
 export function formatDispatchOutcome(project, outcome, { applied = false } = {}) {
   const { dispatch, item, prompt } = outcome;
   const lines = [
     `DISPATCH — ${project.name} / ${item.scopeId || item.order}`,
     `Dispatch: ${dispatch.id}`,
     `Agent: ${item.agent} / ${item.mode}`,
+    `Adapter: ${preparedAdapterLabel(outcome)}`,
     `Route: ${item.state}`,
     `Status: ${dispatch.status}`
   ];
