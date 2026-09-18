@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AGENT_IDS, CODE_AGENT_IDS, getAgentAdapter, isAutomaticAdapter } from "../src/adapters.js";
+import { AGENT_IDS, CODE_AGENT_IDS, getAgentAdapter, isAutomaticAdapter, isAutomaticSessionAdapter } from "../src/adapters.js";
 
 test("adapter registry exposes every routed agent", () => {
   assert.deepEqual(AGENT_IDS, ["codex", "claude-code", "browser", "human"]);
@@ -17,11 +17,12 @@ test("Codex automatic execution is limited to read-only review", () => {
   assert.equal(isAutomaticAdapter(adapter, "execute"), false);
 });
 
-test("Claude Code remains write-capable, isolated and manual", () => {
+test("Claude Code remains direct-manual but can execute in isolated sessions", () => {
   const adapter = getAgentAdapter("claude-code");
   assert.equal(adapter.capability, "write");
   assert.equal(adapter.requiresIsolation, true);
   assert.equal(isAutomaticAdapter(adapter, "execute"), false);
+  assert.equal(isAutomaticSessionAdapter(adapter, "execute"), true);
 });
 
 test("unknown agents do not receive an adapter", () => {

@@ -32,6 +32,7 @@ import { formatGlobalQueue, getGlobalQueue, selectGlobalQueueItem } from "./queu
 import { buildBatchPlan, buildBatchPromptBundle, buildBatchSessionPromptBundle, formatBatchPlan, formatBatchSessions, startBatchSessions } from "./batch.js";
 import { claimScopeCriterion, formatClaim, formatClaimRelease, formatClaims, listClaims, releaseScopeClaim } from "./claims.js";
 import { abandonSession, buildSessionPrompt, cleanupSessionWorkspace, finishSession, formatSession, formatSessionCleanup, formatSessionEnd, formatSessionInspection, formatSessionResult, formatSessions, formatSessionStart, getSession, ingestSessionResult, inspectSessionWorkspace, listSessions, renewSession, startSession } from "./sessions.js";
+import { formatSessionAgentRun, runSessionAgent } from "./session-executor.js";
 import { formatSessionReview, reviewSession } from "./review.js";
 import { buildReviewerPrompt, formatReviewerResult, ingestReviewerResult } from "./reviewer.js";
 import { formatMergeQueue, formatMergeReadiness, getMergeQueue, getMergeReadiness } from "./merge.js";
@@ -56,6 +57,7 @@ Core:
   sumi claims [project] [--all]
   sumi session start <project> <scopeId> [--agent codex|claude-code|browser|human] [--owner label] [--ttl-min n] [--worktree|--no-worktree] [--worktree-root path] [--branch name] [--base ref]
   sumi session prompt <project> <sessionId>
+  sumi session run <project> <sessionId> [--apply] [--finish]
   sumi session result <project> <sessionId> [--file path|--text text] [--apply] [--finish]
   sumi session renew <project> <sessionId> [--ttl-min n]
   sumi session finish <project> <sessionId>
@@ -313,6 +315,17 @@ try {
     const p = project(a);
     if (!b) throw new Error("Session ID is required.");
     console.log(buildSessionPrompt(p, b));
+  } else if (group === "session" && action === "run") {
+    const p = project(a);
+    if (!b) throw new Error("Session ID is required.");
+    const outcome = await runSessionAgent(p, b, { apply: argv.includes("--apply"), finish: argv.includes("--finish") });
+    persist("session.agent.run", {
+      projectId: a, sessionId: outcome.session.id, scopeId: outcome.session.scopeId,
+      agent: outcome.session.agent, adapter: outcome.adapter.id, attempt: outcome.execution.attempt,
+      status: outcome.execution.status, resultId: outcome.result?.id || null,
+      applied: argv.includes("--apply"), finishRequested: argv.includes("--finish")
+    });
+    console.log(formatSessionAgentRun(p, outcome, { applied: argv.includes("--apply") }));
   } else if (group === "session" && action === "result") {
     const p = project(a);
     if (!b) throw new Error("Session ID is required.");
