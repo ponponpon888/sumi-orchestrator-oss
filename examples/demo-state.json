@@ -1,5 +1,6 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "revision": 0,
   "updatedAt": "2026-09-11T00:00:00.000Z",
   "projects": {
     "musubu-doboku": {

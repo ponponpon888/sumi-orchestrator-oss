@@ -119,17 +119,24 @@ const dataPath = global.values.data || defaultDataPath();
 const args = global.positionals;
 let releaseStateLock;
 let state;
+let recoveredFrom;
+let migratedFrom;
 try {
   releaseStateLock = acquireStateLock(dataPath);
   state = loadState(dataPath);
+  recoveredFrom = state.recoveredFrom;
+  migratedFrom = state.migratedFrom;
+  if (recoveredFrom || migratedFrom !== undefined) {
+    saveState(state, dataPath);
+    appendAudit({ kind: "state.repair", recoveredFrom, migratedFrom, schemaVersion: state.schemaVersion, revision: state.revision }, dataPath);
+  }
 } catch (error) {
   releaseStateLock?.();
   console.error(`SUMI error: ${error.message}`);
   process.exit(1);
 }
-if (state.recoveredFrom) {
-  console.error(`SUMI warning: recovered state from backup: ${state.recoveredFrom}`);
-}
+if (recoveredFrom) console.error(`SUMI warning: restored state from backup: ${recoveredFrom}`);
+if (migratedFrom !== undefined) console.error(`SUMI notice: migrated state schema ${migratedFrom} -> ${state.schemaVersion}`);
 const [group, action, a, b] = args;
 
 function project(id) {

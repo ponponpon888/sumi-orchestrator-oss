@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { acquireStateLock, loadState, saveState } from "../src/store.js";
+import { acquireStateLock, CURRENT_SCHEMA_VERSION, loadState, saveState } from "../src/store.js";
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sumi-store-"));
@@ -14,6 +14,34 @@ function fixture(t) {
 function state(summary) {
   return { schemaVersion: 1, updatedAt: "old", projects: { demo: { summary } } };
 }
+
+test("loadState migrates schema v1 to the current schema in memory", (t) => {
+  const file = fixture(t);
+  fs.writeFileSync(file, JSON.stringify(state("legacy")), "utf8");
+  const migrated = loadState(file);
+  assert.equal(migrated.schemaVersion, CURRENT_SCHEMA_VERSION);
+  assert.equal(migrated.revision, 0);
+  assert.equal(migrated.migratedFrom, 1);
+  assert.equal(JSON.stringify(migrated).includes("migratedFrom"), false);
+});
+
+test("saving a migrated state preserves schema v1 as the backup", (t) => {
+  const file = fixture(t);
+  fs.writeFileSync(file, JSON.stringify(state("legacy")), "utf8");
+  const migrated = loadState(file);
+  saveState(migrated, file);
+  assert.equal(loadState(file).schemaVersion, CURRENT_SCHEMA_VERSION);
+  assert.equal(loadState(file).revision, 1);
+  assert.equal(JSON.parse(fs.readFileSync(`${file}.bak`, "utf8")).schemaVersion, 1);
+});
+
+test("loadState refuses a future schema instead of rolling back to a backup", (t) => {
+  const file = fixture(t);
+  saveState(state("backup"), file);
+  saveState(state("current"), file);
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: CURRENT_SCHEMA_VERSION + 1, revision: 1, projects: {} }), "utf8");
+  assert.throws(() => loadState(file), /newer than supported schema/);
+});
 
 test("saveState preserves the previous valid state as a backup", (t) => {
   const file = fixture(t);

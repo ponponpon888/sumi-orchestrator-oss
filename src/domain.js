@@ -14,7 +14,8 @@ export function normalizeProjectPriority(value, fallback = 3) {
 
 export function createEmptyState() {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    revision: 0,
     updatedAt: new Date().toISOString(),
     projects: {}
   };

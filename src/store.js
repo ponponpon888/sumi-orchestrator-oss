@@ -7,14 +7,48 @@ import { createEmptyState, ensureProjectShape } from "./domain.js";
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const DEFAULT_STALE_LOCK_MS = 10 * 60_000;
 const LOCK_RETRY_MS = 50;
+export const CURRENT_SCHEMA_VERSION = 2;
+
+class UnsupportedSchemaError extends Error {
+  constructor(message) {
+    super(message);
+    this.code = "SUMI_UNSUPPORTED_SCHEMA";
+  }
+}
 
 export function defaultDataPath() {
   return process.env.SUMI_DATA || path.join(os.homedir(), ".sumi", "state.json");
 }
 
+function migrateV1ToV2(state) {
+  return { ...state, schemaVersion: 2, revision: 0 };
+}
+
+const migrations = new Map([[1, migrateV1ToV2]]);
+
+function migrateState(state, filePath) {
+  const sourceVersion = state?.schemaVersion;
+  if (!Number.isInteger(sourceVersion) || sourceVersion < 1) {
+    throw new Error(`Unsupported or invalid SUMI state: ${filePath}`);
+  }
+  if (sourceVersion > CURRENT_SCHEMA_VERSION) {
+    throw new UnsupportedSchemaError(`SUMI state schema ${sourceVersion} is newer than supported schema ${CURRENT_SCHEMA_VERSION}: ${filePath}`);
+  }
+  let migrated = state;
+  while (migrated.schemaVersion < CURRENT_SCHEMA_VERSION) {
+    const migrate = migrations.get(migrated.schemaVersion);
+    if (!migrate) throw new Error(`No SUMI state migration from schema ${migrated.schemaVersion}: ${filePath}`);
+    migrated = migrate(migrated);
+  }
+  if (sourceVersion !== migrated.schemaVersion) {
+    Object.defineProperty(migrated, "migratedFrom", { value: sourceVersion, enumerable: false });
+  }
+  return migrated;
+}
+
 function parseState(raw, filePath) {
-  const state = JSON.parse(raw);
-  if (state.schemaVersion !== 1 || !state.projects || typeof state.projects !== "object" || Array.isArray(state.projects)) {
+  const state = migrateState(JSON.parse(raw), filePath);
+  if (!state.projects || typeof state.projects !== "object" || Array.isArray(state.projects) || !Number.isInteger(state.revision) || state.revision < 0) {
     throw new Error(`Unsupported or invalid SUMI state: ${filePath}`);
   }
   for (const project of Object.values(state.projects)) ensureProjectShape(project);
@@ -26,6 +60,7 @@ export function loadState(filePath = defaultDataPath()) {
   try {
     return parseState(fs.readFileSync(filePath, "utf8"), filePath);
   } catch (primaryError) {
+    if (primaryError.code === "SUMI_UNSUPPORTED_SCHEMA") throw primaryError;
     const backupPath = `${filePath}.bak`;
     if (!fs.existsSync(backupPath)) throw primaryError;
     try {
@@ -49,6 +84,11 @@ function writeDurably(filePath, content) {
 }
 
 export function saveState(state, filePath = defaultDataPath()) {
+  if (state.schemaVersion > CURRENT_SCHEMA_VERSION) {
+    throw new UnsupportedSchemaError(`Refusing to overwrite SUMI state schema ${state.schemaVersion}; supported schema is ${CURRENT_SCHEMA_VERSION}: ${filePath}`);
+  }
+  state.schemaVersion = CURRENT_SCHEMA_VERSION;
+  state.revision = (Number.isInteger(state.revision) ? state.revision : 0) + 1;
   state.updatedAt = new Date().toISOString();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;

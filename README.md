@@ -60,6 +60,8 @@ SUMI stores project state outside the source repository:
 %USERPROFILE%\.sumi\state.json
 ```
 
+State files are migrated under an exclusive lock. Before an older schema is replaced, SUMI preserves the previous valid file as `state.json.bak`. A state created by a newer unsupported SUMI version is rejected instead of being silently rolled back.
+
 Updating SUMI therefore does not erase registered project state.
 
 ## Daily entry point
@@ -617,7 +619,7 @@ npm run check
 Current v1 validation target:
 
 ```text
-225 tests passing
+228 tests passing
 syntax checks passing
 ```
 
