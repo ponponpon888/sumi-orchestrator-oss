@@ -1,10 +1,16 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { buildSpawnInvocation, chooseResolvedCommand } from "./sync.js";
 import { analyzeAgentResult, applyAgentResult, recordAgentResult } from "./result.js";
 import { getDispatch } from "./dispatch.js";
 import { touch } from "./domain.js";
 
 const commandPathCache = new Map();
+
+function snapshotSha256(value) {
+  if (!value) return null;
+  return createHash("sha256").update(String(value), "utf8").digest("hex");
+}
 
 function resolveCommand(command) {
   if (commandPathCache.has(command)) return commandPathCache.get(command);
@@ -113,7 +119,9 @@ export function startBrowserDispatch(project, dispatchId, { url, headed = false,
     url,
     headed: Boolean(headed),
     startedAt: new Date().toISOString(),
+    startedCommit: project.deployment?.commit || null,
     lastSnapshot: snapshot.ok ? snapshot.stdout : null,
+    initialSnapshotSha256: snapshot.ok ? snapshotSha256(snapshot.stdout) : null,
     waitWarning: waited.ok ? null : (waited.error || waited.stderr || waited.stdout || "networkidle wait failed")
   };
   touch(project);
@@ -130,29 +138,42 @@ export function checkBrowserDispatch(project, dispatchId, { expectUrls = [], app
   const session = dispatch.browser?.session;
   if (!session) throw new Error(`Dispatch ${dispatch.id} has no browser session metadata.`);
   const cwd = project.local || process.cwd();
+  const verifiedCommit = project.deployment?.commit || null;
+  const startedCommit = dispatch.browser?.startedCommit || null;
+  if (!verifiedCommit) throw new Error("Project commit is unavailable. Run sumi sync before completing browser verification.");
+  if (startedCommit && String(startedCommit).toLowerCase() !== String(verifiedCommit).toLowerCase()) {
+    throw new Error(`Project commit changed during browser verification: ${startedCommit} -> ${verifiedCommit}. Start a new browser dispatch for the current commit.`);
+  }
 
   const urlResult = runBrowser(runner, executable, cwd, session, ["get", "url"], { timeout: 15000 });
   const titleResult = runBrowser(runner, executable, cwd, session, ["get", "title"], { timeout: 15000 });
   const snapshot = runBrowser(runner, executable, cwd, session, ["snapshot", "-i"], { timeout: 30000 });
   if (!urlResult.ok) throw new Error(`agent-browser get url failed: ${urlResult.error || urlResult.stderr || urlResult.stdout}`);
+  if (!snapshot.ok || !snapshot.stdout) throw new Error(`agent-browser snapshot failed: ${snapshot.error || snapshot.stderr || snapshot.stdout || `exit ${snapshot.status}`}`);
 
   const currentUrl = urlResult.stdout.trim();
   const title = titleResult.ok ? titleResult.stdout.trim() : "";
   const matched = expectUrls.length ? urlMatchesAny(currentUrl, expectUrls) : false;
+  const checkedAt = new Date().toISOString();
+  const snapshotHash = snapshotSha256(snapshot.stdout);
   dispatch.browser.lastUrl = currentUrl;
   dispatch.browser.lastTitle = title || null;
-  dispatch.browser.lastSnapshot = snapshot.ok ? snapshot.stdout : dispatch.browser.lastSnapshot || null;
-  dispatch.browser.checkedAt = new Date().toISOString();
+  dispatch.browser.lastSnapshot = snapshot.stdout;
+  dispatch.browser.lastSnapshotSha256 = snapshotHash;
+  dispatch.browser.checkedAt = checkedAt;
 
   if (!expectUrls.length || !matched) {
     touch(project);
-    return { dispatch, currentUrl, title, snapshot: snapshot.stdout, matched, completed: false, result: null, analysis: null, applied: null };
+    return { dispatch, currentUrl, title, commit: verifiedCommit, checkedAt, snapshot: snapshot.stdout, snapshotSha256: snapshotHash, matched, completed: false, result: null, analysis: null, applied: null };
   }
 
   const text = [
     `Browser verification passed for SUMI ${dispatch.scopeId}.`,
+    `Verified commit: ${verifiedCommit}`,
     `Final URL: ${currentUrl}`,
     title ? `Page title: ${title}` : null,
+    `Checked at: ${checkedAt}`,
+    `Snapshot SHA-256: ${snapshotHash}`,
     `Expected URL matched: ${expectUrls.join(" OR ")}`,
     `SUMI ${dispatch.scopeId} can move to done.`
   ].filter(Boolean).join("\n");
@@ -172,12 +193,19 @@ export function checkBrowserDispatch(project, dispatchId, { expectUrls = [], app
   dispatch.reason = null;
   dispatch.browser.completedAt = dispatch.completedAt;
   dispatch.browser.expectedUrls = [...expectUrls];
+  dispatch.browser.verification = {
+    commit: verifiedCommit,
+    url: currentUrl,
+    title: title || null,
+    checkedAt,
+    snapshotSha256: snapshotHash
+  };
   if (closeOnSuccess) {
     const closed = runBrowser(runner, executable, cwd, session, ["close"], { timeout: 15000 });
     dispatch.browser.closed = closed.ok;
   }
   touch(project);
-  return { dispatch, currentUrl, title, snapshot: snapshot.stdout, matched: true, completed: true, result, analysis, applied };
+  return { dispatch, currentUrl, title, commit: verifiedCommit, checkedAt, snapshot: snapshot.stdout, snapshotSha256: snapshotHash, matched: true, completed: true, result, analysis, applied };
 }
 
 export function closeBrowserDispatch(project, dispatchId, { runner = defaultRunner, resolved = browserExecutable() } = {}) {
@@ -204,6 +232,7 @@ export function formatBrowserStart(project, outcome) {
     `Scope: ${outcome.dispatch.scopeId}`,
     `Session: ${b.session}`,
     `URL: ${b.url}`,
+    `Target commit: ${b.startedCommit || "—"}`,
     `Mode: ${b.headed ? "headed" : "headless"}`,
     `Status: ${outcome.dispatch.status}`
   ];
@@ -217,6 +246,9 @@ export function formatBrowserCheck(project, outcome, { applied = false } = {}) {
     `BROWSER CHECK — ${project.name} / ${outcome.dispatch.id}`,
     `Current URL: ${outcome.currentUrl || "—"}`,
     `Title: ${outcome.title || "—"}`,
+    `Verified commit: ${outcome.commit || "—"}`,
+    `Checked at: ${outcome.checkedAt || "—"}`,
+    `Snapshot SHA-256: ${outcome.snapshotSha256 || "—"}`,
     `Matched expectation: ${outcome.matched ? "yes" : "no"}`,
     `Dispatch status: ${outcome.dispatch.status}`
   ];

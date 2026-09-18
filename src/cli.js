@@ -493,14 +493,14 @@ try {
     const dispatchId = b;
     if (!dispatchId) throw new Error("Dispatch ID is required.");
     const outcome = startBrowserDispatch(p, dispatchId, { url: option("url"), headed: argv.includes("--headed") });
-    persist("browser.start", { projectId: a, dispatchId: outcome.dispatch.id, scopeId: outcome.dispatch.scopeId, session: outcome.dispatch.browser?.session, url: outcome.dispatch.browser?.url, headed: outcome.dispatch.browser?.headed });
+    persist("browser.start", { projectId: a, dispatchId: outcome.dispatch.id, scopeId: outcome.dispatch.scopeId, session: outcome.dispatch.browser?.session, url: outcome.dispatch.browser?.url, commit: outcome.dispatch.browser?.startedCommit, headed: outcome.dispatch.browser?.headed });
     console.log(formatBrowserStart(p, outcome));
   } else if (group === "browser" && action === "check") {
     const p = project(a);
     const dispatchId = b;
     if (!dispatchId) throw new Error("Dispatch ID is required.");
     const outcome = checkBrowserDispatch(p, dispatchId, { expectUrls: parseExpectedUrls(option("expect-url")), apply: argv.includes("--apply") });
-    persist("browser.check", { projectId: a, dispatchId: outcome.dispatch.id, scopeId: outcome.dispatch.scopeId, matched: outcome.matched, completed: outcome.completed, resultId: outcome.result?.id || null, applied: argv.includes("--apply") });
+    persist("browser.check", { projectId: a, dispatchId: outcome.dispatch.id, scopeId: outcome.dispatch.scopeId, commit: outcome.commit, url: outcome.currentUrl, checkedAt: outcome.checkedAt, snapshotSha256: outcome.snapshotSha256, matched: outcome.matched, completed: outcome.completed, resultId: outcome.result?.id || null, applied: argv.includes("--apply") });
     console.log(formatBrowserCheck(p, outcome, { applied: argv.includes("--apply") }));
   } else if (group === "browser" && action === "close") {
     const p = project(a);

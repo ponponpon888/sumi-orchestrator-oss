@@ -588,6 +588,7 @@ SUMI TRADE        —   UNSCOPED  GitHub ActionsのCI失敗原因を確認して
 - Production `READY` is not the same as human/browser `verified`.
 - Blockers are not cleared just because `unblock` was requested; fresh evidence must support recovery.
 - PR body text can require browser verification, but it cannot complete the Browser Gate; stored browser/human evidence is required.
+- Browser evidence is bound to the project commit, final URL, check time and interactive snapshot SHA-256.
 - Account/billing blockers route to humans, not coding agents.
 - Scope is the authoritative source for whole-project progress.
 - AI result ingestion applies only high-confidence changes when `--apply` is used.
@@ -620,7 +621,7 @@ npm run check
 Current v1 validation target:
 
 ```text
-231 tests passing
+234 tests passing
 syntax checks passing
 ```
 
