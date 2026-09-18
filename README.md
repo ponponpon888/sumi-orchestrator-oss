@@ -1,4 +1,4 @@
-# SUMI Orchestrator v1.14.3
+# SUMI Orchestrator v1.15.0
 
 SUMI is a local-first development-state orchestrator for AI-assisted software projects.
 
@@ -617,7 +617,7 @@ npm run check
 Current v1 validation target:
 
 ```text
-219 tests passing
+225 tests passing
 syntax checks passing
 ```
 

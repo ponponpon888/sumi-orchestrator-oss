@@ -16,7 +16,7 @@ import {
   touch,
   setProjectPriority
 } from "./domain.js";
-import { appendAudit, defaultDataPath, loadState, saveState } from "./store.js";
+import { acquireStateLock, appendAudit, defaultDataPath, loadState, saveState } from "./store.js";
 import { formatDashboard, formatProject } from "./format.js";
 import { formatHandoff } from "./handoff.js";
 import { diagnoseProject, syncProject } from "./sync.js";
@@ -117,7 +117,19 @@ if (global.values.help || global.positionals.length === 0) {
 
 const dataPath = global.values.data || defaultDataPath();
 const args = global.positionals;
-const state = loadState(dataPath);
+let releaseStateLock;
+let state;
+try {
+  releaseStateLock = acquireStateLock(dataPath);
+  state = loadState(dataPath);
+} catch (error) {
+  releaseStateLock?.();
+  console.error(`SUMI error: ${error.message}`);
+  process.exit(1);
+}
+if (state.recoveredFrom) {
+  console.error(`SUMI warning: recovered state from backup: ${state.recoveredFrom}`);
+}
 const [group, action, a, b] = args;
 
 function project(id) {
@@ -720,4 +732,6 @@ try {
 } catch (error) {
   console.error(`SUMI error: ${error.message}`);
   process.exitCode = 1;
+} finally {
+  releaseStateLock();
 }
