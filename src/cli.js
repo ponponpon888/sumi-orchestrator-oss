@@ -82,8 +82,11 @@ Core:
 
 Project setup:
   sumi project list
-  sumi project add <id> --name <name> [--repo owner/repo] [--local path] [--vercel name] [--supabase id] [--priority 1-5]
-  sumi project set <id> [--name name] [--repo owner/repo] [--local path] [--vercel name] [--supabase id] [--priority 1-5]
+  sumi project add <id> --name <name> [--repo owner/repo] [--local path] [--vercel name|none] [--supabase id|none] [--priority 1-5]
+  sumi project set <id> [--name name] [--repo owner/repo] [--local path] [--vercel name|none] [--supabase id|none] [--priority 1-5]
+    Pass "none" to record that a project deliberately does not use that service.
+    Unregistered and "not used" are reported differently by status/queue, and a
+    project with no completion Scope is shown as UNSCOPED instead of IN DEVELOPMENT.
   sumi scope title <project> <title>
   sumi scope add <project> <criterion> [--status todo|doing|blocked|done]
   sumi scope set <project> <criterionId> --status todo|doing|blocked|done|cancelled

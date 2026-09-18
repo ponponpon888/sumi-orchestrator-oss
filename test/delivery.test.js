@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { addScopeCriterion, createProject } from "../src/domain.js";
+import { addScopeCriterion, createProject, SERVICE_UNUSED } from "../src/domain.js";
 import { reviewSession } from "../src/review.js";
 import { ingestReviewerResult } from "../src/reviewer.js";
 import { startSession } from "../src/sessions.js";
@@ -100,4 +100,14 @@ test("delivery queue prioritizes production failures before delivered sessions",
   const rows = getDeliveryQueue({ delivered: delivered.p, failed: failed.p }, { now: NOW });
   assert.equal(rows[0].status, DELIVERY_STATUSES.PRODUCTION_FAILED);
   assert.equal(rows[1].status, DELIVERY_STATUSES.DELIVERED);
+});
+
+test("delivery gate names vercel=none as the reason production evidence must come from elsewhere", () => {
+  const { p, started, head } = setup();
+  deliveryEvidence(started.session, head);
+  p.vercel = SERVICE_UNUSED;
+
+  const row = getDeliveryReadiness(p, started.session.id, { now: NOW });
+  assert.equal(row.status, DELIVERY_STATUSES.PRODUCTION_EVIDENCE_REQUIRED);
+  assert.match(row.reason, /vercel=none/);
 });

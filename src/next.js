@@ -1,3 +1,5 @@
+import { isProductionObservable } from "./domain.js";
+
 function normalizeText(text) {
   return String(text || "")
     .normalize("NFKC")
@@ -181,7 +183,13 @@ export function buildNextQueue(project, { limit = 8 } = {}) {
   }
 
   // Live observations come next, but collapse into matching scope criteria.
-  for (const text of inferred) addObserved(text);
+  // A Production reminder is dropped when SUMI has no way to observe Production
+  // at all: it can never be satisfied and would sit in the queue forever. An
+  // explicit Scope criterion is unaffected and stays visible below.
+  for (const text of inferred) {
+    if (classifyAction(text) === "production-smoke" && !isProductionObservable(project)) continue;
+    addObserved(text);
+  }
 
   // Keep all remaining unfinished Definition-of-Done items visible even without a live signal.
   for (const item of criteria) {

@@ -1,4 +1,4 @@
-import { getProjectProgress } from "./domain.js";
+import { getProjectProgress, getSetupGaps } from "./domain.js";
 import { getRoutePlan } from "./router.js";
 import { effectiveScopeStatus } from "./next.js";
 
@@ -109,7 +109,23 @@ function renderItem(item, index) {
 }
 
 export function formatGlobalQueue(projects, rows = getGlobalQueue(projects), filters = {}) {
-  const projectCount = Object.values(projects || {}).filter((project) => project?.lifecycle !== "archived").length;
+  const active = Object.values(projects || {}).filter((project) => project?.lifecycle !== "archived");
+  const projectCount = active.length;
+  // Configuration gaps are reported next to the queue but never as queue rows:
+  // they are not dispatchable, and numbering them would shift `--prompt <n>`.
+  const setupRows = active
+    .map((project) => ({ project, gaps: getSetupGaps(project) }))
+    .filter((entry) => entry.gaps.length)
+    .sort((a, b) => (a.project.priority ?? 3) - (b.project.priority ?? 3) || a.project.id.localeCompare(b.project.id));
+  const setupLines = setupRows.length
+    ? [
+      "SETUP REQUIRED (not dispatchable until registered)",
+      ...setupRows.flatMap(({ project, gaps }) => [
+        `  P${project.priority ?? 3} ${project.name} [${project.id}] — ${gaps.map((gap) => gap.key).join(", ")}`,
+        `      詳細: sumi status ${project.id}`
+      ])
+    ]
+    : [];
   const humanBlockers = rows.filter((item) => item.queueClass === "human-blocker");
   const agentReady = rows.filter((item) => item.queueClass === "agent-ready");
   const claimed = rows.filter((item) => item.queueClass === "claimed");
@@ -121,13 +137,14 @@ export function formatGlobalQueue(projects, rows = getGlobalQueue(projects), fil
   const lines = [
     "SUMI GLOBAL QUEUE",
     "=".repeat(72),
-    `Projects: ${projectCount} | Items: ${rows.length} | Human blockers: ${humanBlockers.length} | Agent ready: ${agentReady.length} | Claimed: ${claimed.length} | Waiting: ${waiting.length}${filterBits.length ? ` | Filter: ${filterBits.join(", ")}` : ""}`,
+    `Projects: ${projectCount} | Items: ${rows.length} | Human blockers: ${humanBlockers.length} | Agent ready: ${agentReady.length} | Claimed: ${claimed.length} | Waiting: ${waiting.length}${setupRows.length ? ` | Setup: ${setupRows.length}` : ""}${filterBits.length ? ` | Filter: ${filterBits.join(", ")}` : ""}`,
     ""
   ];
 
   if (!rows.length) {
     lines.push("No matching work items.");
-    return lines.join("\n");
+    if (setupLines.length) lines.push("", ...setupLines);
+    return lines.join("\n").trimEnd();
   }
 
   let offset = 0;
@@ -155,7 +172,10 @@ export function formatGlobalQueue(projects, rows = getGlobalQueue(projects), fil
       lines.push(renderItem(item, offset));
       offset += 1;
     }
+    lines.push("");
   }
+
+  if (setupLines.length) lines.push(...setupLines);
 
   return lines.join("\n").trimEnd();
 }

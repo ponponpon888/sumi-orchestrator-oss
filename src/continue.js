@@ -1,4 +1,4 @@
-import { getCompletion } from "./domain.js";
+import { getCompletion, getSetupGaps } from "./domain.js";
 import { effectiveScopeStatus } from "./next.js";
 import { getRoutePlan } from "./router.js";
 
@@ -34,7 +34,8 @@ export function getContinueSummary(project) {
     ready,
     claimed,
     waiting,
-    recommended
+    recommended,
+    setupGaps: getSetupGaps(project)
   };
 }
 
@@ -64,6 +65,16 @@ export function formatContinue(project, summary = getContinueSummary(project)) {
     lines.push(`  State: ${item.state}`);
     if (item.reason) lines.push(`  Note: ${item.reason}`);
     lines.push("");
+  } else if (summary.setupGaps?.length) {
+    // Nothing can be dispatched yet, but the reason is a missing registration
+    // rather than an absence of work. Point at the command that unblocks it.
+    const gap = summary.setupGaps[0];
+    lines.push("RECOMMENDED NEXT");
+    lines.push(`  ${gap.title}`);
+    lines.push("  Owner: human / setup");
+    lines.push("  State: setup");
+    lines.push(`  Command: ${gap.commands[0]}`);
+    lines.push("");
   } else {
     lines.push("RECOMMENDED NEXT", "  No actionable work detected.", "");
   }
@@ -89,6 +100,15 @@ export function formatContinue(project, summary = getContinueSummary(project)) {
     lines.push("WAITING");
     for (const item of summary.waiting.slice(0, 4)) {
       lines.push(`  - ${item.scopeId ? `${item.scopeId} ` : ""}${item.task}${item.reason ? ` — ${item.reason}` : ""}`);
+    }
+    lines.push("");
+  }
+
+  if (summary.setupGaps?.length) {
+    lines.push("SETUP REQUIRED");
+    for (const gap of summary.setupGaps) {
+      lines.push(`  - ${gap.title}`);
+      for (const command of gap.commands) lines.push(`      ${command}`);
     }
     lines.push("");
   }

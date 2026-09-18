@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { addScopeCriterion, createProject } from "../src/domain.js";
+import { addScopeCriterion, createProject, SERVICE_UNUSED } from "../src/domain.js";
 import { buildNextQueue, classifyAction } from "../src/next.js";
 import { formatProject } from "../src/format.js";
 import { formatHandoff } from "../src/handoff.js";
@@ -64,4 +64,35 @@ test("blocked scope is prioritized and billing blocker gets a distinct semantic 
   addScopeCriterion(p, "GitHub Billing / spending limitを解消し、PR #183のCIを正常に完了させる", "blocked");
   assert.equal(classifyAction("GitHub Billing / spending limitを解消し、PR #183のCIを正常に完了させる"), "ci-billing");
   assert.match(buildNextQueue(p)[0], /^C002 /);
+});
+
+test("a Production reminder disappears when Production cannot be observed at all", () => {
+  const p = createProject({ id: "client-site", name: "client International" });
+  p.observations = { inferredNext: ["Productionの反映状態を確認する"], local: {} };
+  assert.deepEqual(buildNextQueue(p), []);
+
+  p.vercel = SERVICE_UNUSED;
+  assert.deepEqual(buildNextQueue(p), []);
+});
+
+test("a Production reminder stays once any evidence source exists", () => {
+  const registered = createProject({ id: "shingokumon", name: "shingokumon.com", vercel: "shingokumon" });
+  registered.observations = { inferredNext: ["Productionの反映状態を確認する"], local: {} };
+  assert.deepEqual(buildNextQueue(registered), ["Productionの反映状態を確認する"]);
+
+  const linked = createProject({ id: "linked", name: "Linked" });
+  linked.observations = { inferredNext: ["Productionの反映状態を確認する"], vercel: { linked: true }, local: {} };
+  assert.deepEqual(buildNextQueue(linked), ["Productionの反映状態を確認する"]);
+
+  const observed = createProject({ id: "observed", name: "Observed" });
+  observed.deployment.production = "ready";
+  observed.observations = { inferredNext: ["Productionの反映状態を確認する"], local: {} };
+  assert.deepEqual(buildNextQueue(observed), ["Productionの反映状態を確認する"]);
+});
+
+test("an explicit Production scope criterion is never filtered out", () => {
+  const p = createProject({ id: "scoped", name: "Scoped" });
+  addScopeCriterion(p, "マージ後にProduction smoke testを完了する", "todo");
+  p.observations = { inferredNext: ["Productionの反映状態を確認する"], local: {} };
+  assert.deepEqual(buildNextQueue(p), ["C001 マージ後にProduction smoke testを完了する"]);
 });

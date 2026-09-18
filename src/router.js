@@ -1,5 +1,6 @@
 import { buildNextQueue, classifyAction, effectiveScopeStatus, remediationDependencies } from "./next.js";
 import { getActiveClaim } from "./claims.js";
+import { getServiceState } from "./domain.js";
 
 export const AGENTS = new Set(["claude-code", "codex", "browser", "human"]);
 
@@ -152,6 +153,15 @@ export function getRoutePlan(project, { limit = 8 } = {}) {
   });
 }
 
+function supabaseEvidence(project) {
+  const o = project.observations || {};
+  const service = getServiceState(project, "supabase");
+  if (o.supabase?.found) return `${o.supabase.status || "unknown"}${o.supabase.region ? ` (${o.supabase.region})` : ""}`;
+  if (service.state === "registered") return "configured; current health unknown";
+  if (service.state === "unused") return "not used (registered as none)";
+  return "not registered";
+}
+
 function compactState(project) {
   const o = project.observations || {};
   const previewUrl = o.vercel?.preview?.url || null;
@@ -165,7 +175,7 @@ function compactState(project) {
     `CI: ${project.deployment?.ci || "unknown"}`,
     `Preview: ${project.deployment?.preview || "unknown"}${previewUrl ? ` ${previewUrl}` : ""}`,
     `Production: ${project.deployment?.production || "unknown"}${productionUrl ? ` ${productionUrl}` : ""}`,
-    `Supabase: ${o.supabase?.found ? `${o.supabase.status || "unknown"}${o.supabase.region ? ` (${o.supabase.region})` : ""}` : project.supabase ? "configured; current health unknown" : "not configured"}`,
+    `Supabase: ${supabaseEvidence(project)}`,
     `Worktree: ${o.local?.dirty === false ? "clean" : o.local?.dirty === true ? `dirty (${o.local.changedFiles ?? "?"})` : "unknown"}`
   ];
 }

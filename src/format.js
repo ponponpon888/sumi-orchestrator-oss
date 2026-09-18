@@ -1,4 +1,4 @@
-import { getCompletion } from "./domain.js";
+import { getCompletion, getProjectStateLabel, getServiceState, getSetupGaps, PROJECT_STATES } from "./domain.js";
 import { buildNextQueue } from "./next.js";
 
 function ciDetail(project) {
@@ -41,6 +41,16 @@ function latestAgentResult(project) {
   return `\nLATEST RESULT\n  ${item.id} ${item.scopeId} via ${item.agent}${disposition} / evidence ${item.evidence?.length || 0}\n`;
 }
 
+function setupSection(project) {
+  const gaps = getSetupGaps(project);
+  if (!gaps.length) return "";
+  const rows = gaps.flatMap((gap, index) => [
+    `  ${index + 1}. ${gap.title}`,
+    ...gap.commands.map((command) => `     ${command}`)
+  ]);
+  return `\nSETUP REQUIRED\n${rows.join("\n")}\n`;
+}
+
 function recentDone(project) {
   const prs = project.observations?.github?.recentMergedPrs || [];
   if (!prs.length) return "";
@@ -64,18 +74,30 @@ export function formatProject(project) {
   const next = buildNextQueue(project, { limit: 5 });
   const nextText = next.length ? next.map((text, i) => `${i + 1}. ${text}`).join("\n") : "なし";
   const latestDecision = project.decisions.at(-1);
-  const doneLabel = c.complete ? "DONE" : c.implementationDone ? "IMPLEMENTED / PROD UNVERIFIED" : "IN DEVELOPMENT";
+  const doneLabel = getProjectStateLabel(project);
+  const setupGaps = getSetupGaps(project);
+  const setupLabel = setupGaps.length ? `incomplete: ${setupGaps.map((gap) => gap.key).join(", ")}` : "ok";
   const o = project.observations;
   const localState = o?.local?.dirty === true ? `dirty (${o.local.changedFiles ?? "?"})` : o?.local?.dirty === false ? "clean" : "unknown";
   const synced = o?.observedAt ? new Date(o.observedAt).toLocaleString() : "—";
-  const vercelLink = o?.vercel?.linked ? `linked${o.vercel.projectId ? ` (${o.vercel.projectId})` : ""}` : "unknown";
+  const vercelService = getServiceState(project, "vercel");
+  const vercelLink = vercelService.state === "unused"
+    ? "not used"
+    : o?.vercel?.linked
+      ? `linked${o.vercel.projectId ? ` (${o.vercel.projectId})` : ""}`
+      : vercelService.state === "registered" ? `registered (${vercelService.name})` : "not registered";
   const vercelPreview = o?.vercel?.preview?.url ? `${project.deployment.preview} ${o.vercel.preview.url}` : project.deployment.preview;
   const vercelProduction = o?.vercel?.production?.url ? `${project.deployment.production} ${o.vercel.production.url}` : project.deployment.production;
-  const supabaseState = !project.supabase ? "not configured" : o?.supabase?.found ? `${o.supabase.status || "unknown"}${o.supabase.region ? ` (${o.supabase.region})` : ""}` : o?.supabase?.cliAvailable ? "not found" : "unknown";
+  const supabaseService = getServiceState(project, "supabase");
+  const supabaseState = supabaseService.state === "unused"
+    ? "not used"
+    : supabaseService.state === "unregistered"
+      ? "not configured"
+      : o?.supabase?.found ? `${o.supabase.status || "unknown"}${o.supabase.region ? ` (${o.supabase.region})` : ""}` : o?.supabase?.cliAvailable ? "not found" : "unknown";
   const readiness = o?.readiness?.total ? `${o.readiness.ready}/${o.readiness.total} ready${o.readiness.failed ? ` / ${o.readiness.failed} failed` : ""}${o.readiness.pending ? ` / ${o.readiness.pending} pending` : ""}${o.readiness.cancelled ? ` / ${o.readiness.cancelled} cancelled` : ""}` : "—";
   const verification = o?.verification?.required ? `${o.verification.status} (${o.verification.label})` : "not detected";
 
-  return `\n${project.name} [${project.id}]\n${"─".repeat(Math.max(24, project.name.length + project.id.length + 3))}\nSTATE       ${doneLabel}\nPRIORITY    P${project.priority ?? 3}\nPROGRESS    ${p}\nWORK READY  ${readiness}\nREPO        ${project.repo ?? "—"}\nLOCAL       ${project.local ?? "—"}\nBRANCH      ${project.deployment.branch ?? "—"}\nCOMMIT      ${project.deployment.commit ? project.deployment.commit.slice(0, 12) : "—"}\nPR          ${project.deployment.pr ?? "—"}\nCI          ${project.deployment.ci}\nVERIFY      ${verification}\nPREVIEW     ${vercelPreview}\nPRODUCTION  ${vercelProduction}\nVERCEL LINK ${vercelLink}\nSUPABASE    ${supabaseState}\nWORKTREE    ${localState}\nSYNCED      ${synced}\n\nCURRENT\n  ${current}\n\nBLOCKED\n  ${blocked}\n\nNEXT\n${nextText}\n${localChanges(project)}${ciDetail(project)}${recentDone(project)}${openScope(project)}${latestAgentResult(project)}\nLATEST DECISION\n${latestDecision ? `  ${latestDecision.text}${latestDecision.reason ? `\n  Reason: ${latestDecision.reason}` : ""}` : "  なし"}\n`;
+  return `\n${project.name} [${project.id}]\n${"─".repeat(Math.max(24, project.name.length + project.id.length + 3))}\nSTATE       ${doneLabel}\nPRIORITY    P${project.priority ?? 3}\nPROGRESS    ${p}\nSETUP       ${setupLabel}\nWORK READY  ${readiness}\nREPO        ${project.repo ?? "—"}\nLOCAL       ${project.local ?? "—"}\nBRANCH      ${project.deployment.branch ?? "—"}\nCOMMIT      ${project.deployment.commit ? project.deployment.commit.slice(0, 12) : "—"}\nPR          ${project.deployment.pr ?? "—"}\nCI          ${project.deployment.ci}\nVERIFY      ${verification}\nPREVIEW     ${vercelPreview}\nPRODUCTION  ${vercelProduction}\nVERCEL      ${vercelLink}\nSUPABASE    ${supabaseState}\nWORKTREE    ${localState}\nSYNCED      ${synced}\n\nCURRENT\n  ${current}\n\nBLOCKED\n  ${blocked}\n\nNEXT\n${nextText}\n${setupSection(project)}${localChanges(project)}${ciDetail(project)}${recentDone(project)}${openScope(project)}${latestAgentResult(project)}\nLATEST DECISION\n${latestDecision ? `  ${latestDecision.text}${latestDecision.reason ? `\n  Reason: ${latestDecision.reason}` : ""}` : "  なし"}\n`;
 }
 
 export function formatDashboard(projects) {
@@ -86,8 +108,19 @@ export function formatDashboard(projects) {
       const progress = c.percent === null ? "  —" : `${String(c.percent).padStart(3)}%`;
       const scopeBlocked = (p.scope?.criteria || []).some((item) => item.status === "blocked");
       const scopeDoing = (p.scope?.criteria || []).some((item) => item.status === "doing");
-      const state = c.complete ? "DONE" : c.blockers.length || scopeBlocked ? "BLOCKED" : c.current.length || scopeDoing || p.observations?.github?.openPrTitle ? "DOING" : "READY";
-      const next = buildNextQueue(p, { limit: 1 })[0] ?? c.todos[0]?.title ?? p.observations?.github?.openPrTitle ?? "—";
+      const gaps = getSetupGaps(p);
+      const unscoped = getProjectStateLabel(p) === PROJECT_STATES.UNSCOPED;
+      const state = c.complete
+        ? "DONE"
+        : c.blockers.length || scopeBlocked
+          ? "BLOCKED"
+          : c.current.length || scopeDoing || p.observations?.github?.openPrTitle
+            ? "DOING"
+            : unscoped ? "UNSCOPED" : "READY";
+      const next = buildNextQueue(p, { limit: 1 })[0]
+        ?? c.todos[0]?.title
+        ?? p.observations?.github?.openPrTitle
+        ?? (gaps.length ? `setup: ${gaps.map((gap) => gap.key).join(", ")}` : "—");
       return `${p.id.padEnd(20)} P${p.priority ?? 3}   ${progress.padEnd(5)} ${state.padEnd(8)} ${next}`;
     });
   return `SUMI DASHBOARD\n${"=".repeat(72)}\nPROJECT              PRI  PROG  STATE    NEXT\n${"-".repeat(72)}\n${rows.join("\n") || "No projects yet."}\n`;

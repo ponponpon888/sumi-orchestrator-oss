@@ -109,6 +109,20 @@ sumi project add musubu `
   --supabase "abcdefghijklmnopqrst"
 ```
 
+Omitting `--vercel` or `--supabase` means **not registered yet**, which SUMI reports as a setup gap. When a project genuinely does not use a service, record that explicitly with `none` so it stops being reported as missing:
+
+```powershell
+sumi project set ai-workforce --vercel none
+sumi project set ai-workforce --supabase none
+```
+
+SUMI treats the two cases differently:
+
+- **not registered** — SUMI cannot observe that service, so it does not invent work that depends on it
+- **`none` (not used)** — SUMI never calls that CLI for the project and never asks for the registration again
+
+A project with no completion Scope is reported as `UNSCOPED` rather than `IN DEVELOPMENT`, and `status` / `continue` / `queue` list the exact commands that close each gap under `SETUP REQUIRED`. Registration and Scope are never inferred automatically, and `DONE` still requires explicit Scope plus production evidence.
+
 List registered projects:
 
 ```powershell
@@ -556,6 +570,16 @@ AI WORKFORCE    72%   WAITING   Windows approval
 
 Percentages appear only where an explicit completion Scope exists.
 
+The `STATE` column separates a project that is genuinely being worked on from one that has never declared its Definition of Done:
+
+```text
+SHARENAIL       100%  DONE      —
+client INTL      —   UNSCOPED  setup: scope, vercel
+SUMI TRADE        —   UNSCOPED  GitHub ActionsのCI失敗原因を確認して修正する
+```
+
+`UNSCOPED` means the completion Scope is empty, so no percentage can exist. Projects with configuration gaps are listed under `SETUP REQUIRED` in `sumi queue`, separately from dispatchable work, and they are never numbered, so `queue --prompt <number>` keeps pointing at the same item.
+
 ## Safety principles
 
 - Observation is read-only by default.
@@ -593,7 +617,7 @@ npm run check
 Current v1 validation target:
 
 ```text
-190 tests passing
+219 tests passing
 syntax checks passing
 ```
 

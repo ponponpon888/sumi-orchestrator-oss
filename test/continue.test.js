@@ -89,6 +89,20 @@ test("continue recommends actionable human remediation before its blocked produc
   assert.equal(summary.blockers.some((item) => item.id === remediation.id), false);
 });
 
+test("continue recommends the missing registration when nothing can be dispatched", () => {
+  const p = createProject({ id: "client-site", name: "client International", repo: "owner/client-site", local: "C:\\Dev\\client-site" });
+  p.observations = { local: { dirty: false, changedFiles: 0 }, inferredNext: ["Productionの反映状態を確認する"] };
+  const summary = getContinueSummary(p);
+
+  assert.equal(summary.recommended, null);
+  assert.deepEqual(summary.setupGaps.map((gap) => gap.key), ["scope", "vercel"]);
+
+  const text = formatContinue(p, summary);
+  assert.match(text, /RECOMMENDED NEXT[\s\S]*完了条件\(Scope\)が未定義/);
+  assert.match(text, /SETUP REQUIRED[\s\S]*sumi project set client-site --vercel/);
+  assert.doesNotMatch(text, /No actionable work detected/);
+});
+
 test("continue queue orders ready work before waiting dependencies", () => {
   const { p, remediation } = productionRemediationProject();
   const summary = getContinueSummary(p);

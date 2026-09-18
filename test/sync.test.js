@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { addScopeCriterion, createProject } from "../src/domain.js";
+import { addScopeCriterion, createProject, SERVICE_UNUSED } from "../src/domain.js";
 import { aggregateGithubCi, aggregateStoredProductionVerification, parseVercelList, selectCurrentOpenPr, shouldSyncVercelPreview, summarizeBaselineCi, syncProject, syncVercel } from "../src/sync.js";
 import { formatHandoff } from "../src/handoff.js";
 import { formatProject } from "../src/format.js";
@@ -512,6 +512,37 @@ test("parseGitPorcelain preserves status and path for dirty-file reporting", asy
   ]);
 });
 
+test("parseGitPorcelain keeps the status column intact on every line", async () => {
+  const { parseGitPorcelain } = await import("../src/sync.js");
+  const rows = parseGitPorcelain(" M src/app/tasks/new/page.tsx\n M src/lib/supabase/server.ts\nM  src/staged.ts\n");
+  assert.deepEqual(rows, [
+    { status: " M", path: "src/app/tasks/new/page.tsx" },
+    { status: " M", path: "src/lib/supabase/server.ts" },
+    { status: "M ", path: "src/staged.ts" }
+  ]);
+});
+
+test("sync reports the full path when the first change is unstaged", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sumi-porcelain-"));
+  fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "src", "page.tsx"), "export const page = 1;\n");
+  git(dir, "init");
+  git(dir, "config", "user.email", "test@example.com");
+  git(dir, "config", "user.name", "SUMI Test");
+  git(dir, "add", ".");
+  git(dir, "commit", "-m", "initial commit");
+  // Unstaged modification: git prints " M src/page.tsx" with a leading space,
+  // which must survive the command-output handling.
+  fs.writeFileSync(path.join(dir, "src", "page.tsx"), "export const page = 2;\n");
+
+  const p = createProject({ id: "porcelain", name: "Porcelain", local: dir });
+  const o = syncProject(p, { skipVercel: true, skipSupabase: true });
+
+  assert.equal(o.local.dirty, true);
+  assert.equal(o.local.changedFiles, 1);
+  assert.deepEqual(o.local.changes, [{ status: " M", path: "src/page.tsx" }]);
+});
+
 
 test("formatProject renders Supabase health and local dirty files", () => {
   const p = createProject({ id: "visible", name: "Visible", supabase: "abc" });
@@ -651,4 +682,80 @@ test("handoff current and blocked include scope workflow state", async () => {
   const handoff = formatHandoff(p);
   assert.match(handoff, /## Current[\s\S]*C002 Browser verification/);
   assert.match(handoff, /## Blocked[\s\S]*C003 Production smoke test/);
+});
+
+test("vercel=none never reaches the Vercel CLI", () => {
+  const p = musubuProductionFixture();
+  p.vercel = SERVICE_UNUSED;
+  p.deployment.pr = null;
+  p.deployment.preview = "cancelled";
+  const calls = [];
+  const observations = emptyVercelObservations();
+  observations.vercel.linked = false;
+
+  syncVercel(p, observations, {
+    commandAvailable: true,
+    runner: vercelRunner({ ok: true, stdout: VERCEL_PRODUCTION_OUTPUT, stderr: "" }, calls)
+  });
+
+  assert.deepEqual(calls, []);
+  assert.deepEqual(observations.warnings, []);
+  assert.equal(p.deployment.preview, "cancelled");
+});
+
+test("vercel=none does not warn about a missing Vercel CLI", () => {
+  const p = musubuProductionFixture();
+  p.vercel = SERVICE_UNUSED;
+  const observations = emptyVercelObservations();
+  observations.vercel.linked = false;
+
+  syncVercel(p, observations, {
+    commandAvailable: false,
+    runner: () => { throw new Error("runner must not be called for vercel=none"); }
+  });
+
+  assert.deepEqual(observations.warnings, []);
+});
+
+test("explicit vercel=none survives a local .vercel link and supabase=none skips its CLI", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sumi-service-none-"));
+  fs.writeFileSync(path.join(dir, "README.md"), "hello\n");
+  git(dir, "init");
+  git(dir, "config", "user.email", "test@example.com");
+  git(dir, "config", "user.name", "SUMI Test");
+  git(dir, "add", "README.md");
+  git(dir, "commit", "-m", "initial commit");
+  fs.mkdirSync(path.join(dir, ".vercel"));
+  fs.writeFileSync(
+    path.join(dir, ".vercel", "project.json"),
+    JSON.stringify({ projectId: "prj_fixture", orgId: "team_fixture", projectName: "linked-fixture" })
+  );
+
+  const p = createProject({ id: "service-none", name: "Service None", local: dir });
+  p.vercel = SERVICE_UNUSED;
+  p.supabase = SERVICE_UNUSED;
+  const o = syncProject(p, { skipVercel: true, skipSupabase: false });
+
+  assert.equal(p.vercel, SERVICE_UNUSED);
+  assert.equal(o.supabase.configured, false);
+  assert.equal(o.warnings.some((warning) => /Supabase/i.test(warning)), false);
+  assert.ok(o.warnings.some((warning) => /registered as vercel=none/.test(warning)));
+});
+
+test("sync stops suggesting a Production check it has no way to observe", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sumi-infer-production-"));
+  fs.writeFileSync(path.join(dir, "README.md"), "hello\n");
+  git(dir, "init");
+  git(dir, "config", "user.email", "test@example.com");
+  git(dir, "config", "user.name", "SUMI Test");
+  git(dir, "add", "README.md");
+  git(dir, "commit", "-m", "initial commit");
+
+  const unobservable = createProject({ id: "unobservable", name: "Unobservable", local: dir });
+  const withoutSource = syncProject(unobservable, { skipVercel: true, skipSupabase: true });
+  assert.equal(withoutSource.inferredNext.includes("Productionの反映状態を確認する"), false);
+
+  const registered = createProject({ id: "registered", name: "Registered", local: dir, vercel: "registered-app" });
+  const withSource = syncProject(registered, { skipVercel: true, skipSupabase: true });
+  assert.ok(withSource.inferredNext.includes("Productionの反映状態を確認する"));
 });

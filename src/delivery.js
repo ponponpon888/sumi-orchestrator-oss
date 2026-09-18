@@ -1,4 +1,4 @@
-import { touch } from "./domain.js";
+import { getServiceState, touch } from "./domain.js";
 import { getSession } from "./sessions.js";
 import { commandExists, mapVercelStatus, parseVercelList, runCommand } from "./sync.js";
 
@@ -127,9 +127,10 @@ export function syncDeliveryEvidence(project, sessionId, { now = new Date() } = 
   }
 
   const mergeCommit = evidence.pr.mergeCommit;
-  if (project.vercel && mergeCommit && commandExists("vercel")) {
+  const vercelService = getServiceState(project, "vercel");
+  if (vercelService.state === "registered" && mergeCommit && commandExists("vercel")) {
     const prodResult = runCommand("vercel", [
-      "list", project.vercel, "--prod", "--meta", `githubCommitSha=${mergeCommit}`, "--no-color"
+      "list", vercelService.name, "--prod", "--meta", `githubCommitSha=${mergeCommit}`, "--no-color"
     ], { cwd: project.local || record.workspace?.path || undefined, timeout: 30000 });
     if (prodResult.ok) {
       evidence.source.production = true;
@@ -187,7 +188,9 @@ export function getDeliveryReadiness(project, sessionId, { now = new Date(), max
     return { ...row, status: DELIVERY_STATUSES.MERGED_HEAD_MISMATCH, reason: "The merged PR head does not match the HEAD that passed RELEASE_READY." };
   }
   if (!evidence.pr?.mergeCommit) return { ...row, status: DELIVERY_STATUSES.MERGE_COMMIT_UNKNOWN, reason: "GitHub did not provide the merge commit for the certified PR." };
-  if (!project.vercel) return { ...row, status: DELIVERY_STATUSES.PRODUCTION_EVIDENCE_REQUIRED, reason: "No Vercel project is configured; production evidence must be supplied by another verifier." };
+  const vercelState = getServiceState(project, "vercel").state;
+  if (vercelState === "unused") return { ...row, status: DELIVERY_STATUSES.PRODUCTION_EVIDENCE_REQUIRED, reason: "This project is registered as vercel=none; production evidence must be supplied by another verifier." };
+  if (vercelState !== "registered") return { ...row, status: DELIVERY_STATUSES.PRODUCTION_EVIDENCE_REQUIRED, reason: "No Vercel project is registered; production evidence must be supplied by another verifier." };
   if (!evidence.source?.production || !evidence.production) return { ...row, status: DELIVERY_STATUSES.PRODUCTION_EVIDENCE_REQUIRED, reason: "No production deployment evidence was found for the exact merge commit." };
   if (evidence.production.status === "failed") return { ...row, status: DELIVERY_STATUSES.PRODUCTION_FAILED, reason: "Production deployment for the merge commit failed." };
   if (evidence.production.status === "pending") return { ...row, status: DELIVERY_STATUSES.PRODUCTION_PENDING, reason: "Production deployment for the merge commit is still pending." };

@@ -62,6 +62,25 @@ function defaultWorktreeRoot() {
   return process.env.SUMI_WORKTREE_ROOT || path.join(os.homedir(), ".sumi", "worktrees");
 }
 
+function canonicalPath(value) {
+  const resolved = path.resolve(value);
+  const suffix = [];
+  let existing = resolved;
+
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) return resolved;
+    suffix.unshift(path.basename(existing));
+    existing = parent;
+  }
+
+  try {
+    return path.join(fs.realpathSync.native(existing), ...suffix);
+  } catch {
+    return resolved;
+  }
+}
+
 function runGit(args, { cwd = null } = {}) {
   try {
     return execFileSync("git", args, {
@@ -84,12 +103,12 @@ function resolveRepoRoot(project) {
 }
 
 function createWorktree(project, sessionId, scopeId, { root = defaultWorktreeRoot(), baseRef = "HEAD", branch = null } = {}) {
-  const repoRoot = resolveRepoRoot(project);
+  const repoRoot = canonicalPath(resolveRepoRoot(project));
   const dirtyBase = runGit(["-C", repoRoot, "status", "--porcelain"]);
   if (dirtyBase) {
     throw new Error(`Primary worktree is dirty; commit or stash changes before creating an isolated session worktree: ${repoRoot}`);
   }
-  const workspacePath = path.resolve(root, safeSegment(project.id), sessionId.toLowerCase());
+  const workspacePath = canonicalPath(path.resolve(root, safeSegment(project.id), sessionId.toLowerCase()));
   const relativeToRepo = path.relative(repoRoot, workspacePath);
   if (relativeToRepo === "" || (!relativeToRepo.startsWith("..") && !path.isAbsolute(relativeToRepo))) {
     throw new Error(`Session worktree must be outside the primary repository: ${workspacePath}`);

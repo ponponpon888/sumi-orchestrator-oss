@@ -77,6 +77,24 @@ test("global queue selector accepts display number and stable project:scope ID",
 });
 
 
+test("global queue lists setup-incomplete projects separately from dispatchable work", () => {
+  const client = project("client-site", "client International");
+  client.observations = { inferredNext: ["Productionの反映状態を確認する"], local: { dirty: false, changedFiles: 0 } };
+
+  const ready = project("ready-app", "Ready App");
+  ready.vercel = "ready-app";
+  addScopeCriterion(ready, "認証フローを実ブラウザで検証する", "todo");
+
+  const rows = getGlobalQueue({ client, ready });
+  assert.deepEqual(rows.map((row) => row.projectId), ["ready-app"]);
+
+  const output = formatGlobalQueue({ client, ready }, rows);
+  assert.match(output, /Setup: 1/);
+  assert.match(output, /SETUP REQUIRED[\s\S]*client International \[client-site\] — scope, vercel/);
+  assert.match(output, /sumi status client-site/);
+  assert.equal(selectGlobalQueueItem(rows, "1").projectId, "ready-app");
+});
+
 test("global queue marks active leases as claimed and removes them from ready filter", () => {
   const app = project("app", "App");
   const item = addScopeCriterion(app, "Implement authentication middleware", "todo");

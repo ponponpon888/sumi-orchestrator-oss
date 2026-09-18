@@ -232,6 +232,84 @@ export function getCompletion(project) {
   };
 }
 
+export const SERVICE_UNUSED = "none";
+export const PROJECT_STATES = {
+  DONE: "DONE",
+  IMPLEMENTED: "IMPLEMENTED / PROD UNVERIFIED",
+  IN_DEVELOPMENT: "IN DEVELOPMENT",
+  UNSCOPED: "UNSCOPED"
+};
+
+/**
+ * Distinguish an unregistered external service from one that is deliberately
+ * not used. `null`/empty means "never registered"; the explicit SERVICE_UNUSED
+ * sentinel means the project does not use that service at all.
+ */
+export function getServiceState(project, service) {
+  const raw = project?.[service];
+  const value = typeof raw === "string" ? raw.trim() : raw;
+  if (value === SERVICE_UNUSED) return { state: "unused", name: null };
+  if (value) return { state: "registered", name: String(value) };
+  return { state: "unregistered", name: null };
+}
+
+export function isServiceRegistered(project, service) {
+  return getServiceState(project, service).state === "registered";
+}
+
+/**
+ * True when SUMI has any way to observe Production: a registered Vercel
+ * project, a locally linked one, or a deployment status already recorded by
+ * sync or `deploy set`.
+ */
+export function isProductionObservable(project) {
+  if (isServiceRegistered(project, "vercel")) return true;
+  if (project?.observations?.vercel?.linked) return true;
+  const production = project?.deployment?.production;
+  return Boolean(production) && production !== "unknown";
+}
+
+export function getProjectStateLabel(project) {
+  const completion = getCompletion(project);
+  if (completion.complete) return PROJECT_STATES.DONE;
+  if (completion.implementationDone) return PROJECT_STATES.IMPLEMENTED;
+  // A project without any countable completion criterion cannot be called "in
+  // development"; its Definition of Done has simply never been declared.
+  if (completion.total === 0) return PROJECT_STATES.UNSCOPED;
+  return PROJECT_STATES.IN_DEVELOPMENT;
+}
+
+/**
+ * Configuration gaps that stop SUMI from judging or progressing a project.
+ * Each gap carries the exact CLI command that closes it. A missing Supabase
+ * registration is deliberately not a gap: it never gates queue work.
+ */
+export function getSetupGaps(project) {
+  ensureProjectShape(project);
+  const gaps = [];
+  if (getScopeProgress(project).total === 0) {
+    gaps.push({
+      key: "scope",
+      title: "完了条件(Scope)が未定義",
+      commands: [
+        `sumi scope suggest ${project.id}`,
+        `sumi scope add ${project.id} "<完了条件>"`
+      ]
+    });
+  }
+  if (getServiceState(project, "vercel").state === "unregistered" && !project?.observations?.vercel?.linked) {
+    gaps.push({
+      key: "vercel",
+      title: "Vercel連携が未登録",
+      commands: [
+        `sumi project set ${project.id} --vercel <vercel-project-name>`,
+        `sumi project set ${project.id} --vercel ${SERVICE_UNUSED}   # Vercelを使わない場合`
+      ]
+    });
+  }
+  return gaps;
+}
+
 export function touch(project) {
   project.updatedAt = new Date().toISOString();
 }

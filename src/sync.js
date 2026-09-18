@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { getCompletion, touch } from "./domain.js";
+import { getCompletion, getServiceState, isProductionObservable, SERVICE_UNUSED, touch } from "./domain.js";
 import { classifyAction } from "./next.js";
 
 const commandPathCache = new Map();
@@ -56,6 +56,14 @@ export function buildSpawnInvocation(resolved, args, platform = process.platform
   return { command: resolved, args, shell: false, windowsVerbatimArguments: false };
 }
 
+// `git status --porcelain` encodes the index/worktree state in the first two
+// columns, so a leading space is meaningful (" M path" = modified, unstaged).
+// Trimming the whole output would eat that column on the first line only, which
+// shifts every later slice and silently corrupts the reported path.
+function trimTrailingWhitespace(value) {
+  return String(value ?? "").replace(/\s+$/, "");
+}
+
 export function runCommand(command, args, options = {}) {
   const resolved = resolveCommand(command) || command;
   let invocation;
@@ -78,7 +86,7 @@ export function runCommand(command, args, options = {}) {
     ok: result.status === 0,
     status: result.status,
     signal: result.signal || null,
-    stdout: (result.stdout || "").trim(),
+    stdout: trimTrailingWhitespace(result.stdout),
     stderr: (result.stderr || "").trim(),
     error: result.error?.message || null,
     errorCode: result.error?.code || null,
@@ -203,12 +211,16 @@ export function shouldSyncVercelPreview(project) {
 
 export function syncVercel(project, observations, dependencies = {}) {
   const runner = dependencies.runner || runCommand;
+  const service = getServiceState(project, "vercel");
+  // A project explicitly registered as not using Vercel must never reach the
+  // CLI: the sentinel is a registration decision, not a deployment name.
+  if (service.state === "unused") return;
   observations.vercel.cliAvailable = dependencies.commandAvailable ?? commandExists("vercel");
   if (!observations.vercel.cliAvailable) {
-    if (observations.vercel.linked || project.vercel) observations.warnings.push("Vercel CLI is not installed; deployment sync skipped");
+    if (observations.vercel.linked || service.state === "registered") observations.warnings.push("Vercel CLI is not installed; deployment sync skipped");
     return;
   }
-  const projectName = project.vercel || observations.vercel.projectName;
+  const projectName = service.name || observations.vercel.projectName;
   if (!projectName) return;
 
   const cwd = project.local && fs.existsSync(project.local) ? project.local : undefined;
@@ -248,8 +260,11 @@ export function syncVercel(project, observations, dependencies = {}) {
 }
 
 function syncSupabase(project, observations) {
-  observations.supabase.configured = Boolean(project.supabase);
-  if (!project.supabase) return;
+  const service = getServiceState(project, "supabase");
+  observations.supabase.configured = service.state === "registered";
+  // "unused" and "unregistered" both mean there is nothing to query; the
+  // sentinel must not be sent to the CLI as a project ref.
+  if (service.state !== "registered") return;
   const cli = resolveSupabaseCli(project.local);
   observations.supabase.cliAvailable = Boolean(cli);
   if (!cli) {
@@ -419,7 +434,12 @@ function inferNext(project, observations) {
   if (project.deployment.pr && project.deployment.ci === "ready" && project.deployment.preview === "ready") pushUnique(inferred, `PR #${project.deployment.pr}をレビューしてマージ可否を判断する`);
   if (observations.supabase?.healthy === false) pushUnique(inferred, "Supabaseのプロジェクト状態を確認する");
   if (!project.deployment.pr && project.deployment.production === "failed") pushUnique(inferred, "Productionデプロイ失敗を確認する");
-  else if (!project.deployment.pr && project.deployment.production !== "verified") pushUnique(inferred, "Productionの反映状態を確認する");
+  // Only suggest a Production check when SUMI can actually observe Production.
+  // Without a registered/linked Vercel project or an already observed status,
+  // the check has no evidence source and would never leave the queue.
+  else if (!project.deployment.pr && project.deployment.production !== "verified" && isProductionObservable(project)) {
+    pushUnique(inferred, "Productionの反映状態を確認する");
+  }
   return inferred.slice(0, 5);
 }
 
@@ -649,7 +669,7 @@ export function syncProject(project, options = {}) {
       baselineCi: null, baselineFailureLikely: false, prListObserved: false
     },
     vercel: { linked: false, projectId: null, orgId: null, projectName: null, cliAvailable: false, preview: null, production: null },
-    supabase: { configured: Boolean(project.supabase), cliAvailable: false, found: false, status: null, healthy: null, name: null, region: null },
+    supabase: { configured: getServiceState(project, "supabase").state === "registered", cliAvailable: false, found: false, status: null, healthy: null, name: null, region: null },
     verification: { required: false, status: "unknown", label: null, evidence: null },
     readiness: { checks: [], ready: 0, total: 0, failed: 0, pending: 0, cancelled: 0 },
     inferredNext: [], warnings: []
@@ -683,7 +703,13 @@ export function syncProject(project, options = {}) {
     const vercel = readVercelLink(project.local);
     if (vercel) {
       observations.vercel = { linked: true, ...vercel };
-      if (!project.vercel && vercel.projectName) project.vercel = vercel.projectName;
+      const service = getServiceState(project, "vercel");
+      if (service.state === "unregistered" && vercel.projectName) project.vercel = vercel.projectName;
+      // An explicit "not used" registration outranks a stale local link, so the
+      // operator's decision is never silently overwritten.
+      else if (service.state === "unused") {
+        observations.warnings.push(`Local .vercel link found (${vercel.projectName || "unknown project"}) but this project is registered as vercel=${SERVICE_UNUSED}`);
+      }
     }
   }
 
