@@ -587,6 +587,7 @@ SUMI TRADE        —   UNSCOPED  GitHub ActionsのCI失敗原因を確認して
 - Observation is read-only by default.
 - Production `READY` is not the same as human/browser `verified`.
 - Blockers are not cleared just because `unblock` was requested; fresh evidence must support recovery.
+- PR body text can require browser verification, but it cannot complete the Browser Gate; stored browser/human evidence is required.
 - Account/billing blockers route to humans, not coding agents.
 - Scope is the authoritative source for whole-project progress.
 - AI result ingestion applies only high-confidence changes when `--apply` is used.
@@ -619,7 +620,7 @@ npm run check
 Current v1 validation target:
 
 ```text
-228 tests passing
+231 tests passing
 syntax checks passing
 ```
 

@@ -320,7 +320,7 @@ function summarizeFailureLog(text) {
   return [...new Set(rows)].slice(-6);
 }
 
-function inferManualVerification(body) {
+export function inferManualVerification(body) {
   if (!body) return { required: false, status: "unknown", label: null, evidence: null };
   const mentionsBrowser = /ブラウザ|browser/i.test(body);
   if (!mentionsBrowser) return { required: false, status: "unknown", label: null, evidence: null };
@@ -328,7 +328,7 @@ function inferManualVerification(body) {
     return { required: true, status: "pending", label: "browser/manual verification", evidence: "PR body says browser/manual verification is not complete" };
   }
   if (/実施済|確認済|検証済|verified|tested|checked/i.test(body)) {
-    return { required: true, status: "ready", label: "browser/manual verification", evidence: "PR body indicates browser/manual verification is complete" };
+    return { required: true, status: "pending", label: "browser/manual verification", evidence: "PR body claims browser/manual verification is complete; direct SUMI browser/human evidence is required" };
   }
   return { required: true, status: "pending", label: "browser/manual verification", evidence: "PR body mentions browser verification" };
 }

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { addScopeCriterion, createProject, SERVICE_UNUSED } from "../src/domain.js";
-import { aggregateGithubCi, aggregateStoredProductionVerification, parseVercelList, selectCurrentOpenPr, shouldSyncVercelPreview, summarizeBaselineCi, syncProject, syncVercel } from "../src/sync.js";
+import { aggregateGithubCi, aggregateStoredProductionVerification, inferManualVerification, parseVercelList, selectCurrentOpenPr, shouldSyncVercelPreview, summarizeBaselineCi, syncProject, syncVercel } from "../src/sync.js";
 import { formatHandoff } from "../src/handoff.js";
 import { formatProject } from "../src/format.js";
 
@@ -43,6 +43,26 @@ function musubuProductionFixture() {
 function emptyVerification() {
   return { verification: { required: false, status: "unknown", label: null, evidence: null } };
 }
+
+test("PR body without browser language does not create a verification gate", () => {
+  assert.deepEqual(inferManualVerification("Unit tests passed."), {
+    required: false, status: "unknown", label: null, evidence: null
+  });
+});
+
+test("PR body keeps explicitly incomplete browser verification pending", () => {
+  const verification = inferManualVerification("Browser verification not verified yet.");
+  assert.equal(verification.required, true);
+  assert.equal(verification.status, "pending");
+  assert.match(verification.evidence, /not complete/);
+});
+
+test("PR body completion claim cannot mark browser verification ready", () => {
+  const verification = inferManualVerification("Browser verification tested and verified.");
+  assert.equal(verification.required, true);
+  assert.equal(verification.status, "pending");
+  assert.match(verification.evidence, /direct SUMI browser\/human evidence is required/);
+});
 
 function githubObservations(baselineCi) {
   return {
