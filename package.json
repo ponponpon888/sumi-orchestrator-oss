@@ -1,6 +1,6 @@
 {
   "name": "sumi-orchestrator",
-  "version": "1.15.0",
+  "version": "1.15.1",
   "private": true,
   "description": "Development state orchestrator for AI-assisted software projects.",
   "type": "module",

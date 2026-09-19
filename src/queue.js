@@ -48,6 +48,7 @@ export function getGlobalQueue(projects, { agent = null, state = null, limit = 2
 
   for (const project of Object.values(projects || {})) {
     if (!project || project.lifecycle === "archived") continue;
+    if (!(project.scope?.criteria || []).length) continue;
     const progress = getProjectProgress(project);
     const plan = getRoutePlan(project, { limit: 8 });
 

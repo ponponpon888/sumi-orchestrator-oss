@@ -95,6 +95,23 @@ test("global queue lists setup-incomplete projects separately from dispatchable 
   assert.equal(selectGlobalQueueItem(rows, "1").projectId, "ready-app");
 });
 
+test("global queue excludes a project missing only completion scope", () => {
+  const unscoped = project("scope-only", "Scope Only");
+  unscoped.vercel = "scope-only";
+  unscoped.observations = {
+    inferredNext: ["Investigate and fix the current CI failure"],
+    local: { dirty: false, changedFiles: 0 }
+  };
+
+  assert.equal(getGlobalQueue({ unscoped }).length, 0);
+  assert.equal(getGlobalQueue({ unscoped }, { state: "ready" }).length, 0);
+
+  const output = formatGlobalQueue({ unscoped }, []);
+  assert.match(output, /Items: 0/);
+  assert.match(output, /Setup: 1/);
+  assert.match(output, /SETUP REQUIRED[\s\S]*Scope Only \[scope-only\].*scope/);
+});
+
 test("global queue marks active leases as claimed and removes them from ready filter", () => {
   const app = project("app", "App");
   const item = addScopeCriterion(app, "Implement authentication middleware", "todo");

@@ -1,4 +1,4 @@
-# SUMI Orchestrator v1.15.0
+# SUMI Orchestrator v1.15.1
 
 SUMI is a local-first development-state orchestrator for AI-assisted software projects.
 
