@@ -623,7 +623,7 @@ npm run check
 Current v1 validation target:
 
 ```text
-245 tests passing
+246 tests passing
 syntax checks passing
 ```
 

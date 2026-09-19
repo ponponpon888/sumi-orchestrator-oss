@@ -40,8 +40,12 @@ import { formatReleaseQueue, formatReleaseReadiness, getReleaseQueue, getRelease
 import { formatDeliveryQueue, formatDeliveryReadiness, getDeliveryQueue, getDeliveryReadiness, syncDeliveryEvidence, verifyDelivery } from "./delivery.js";
 import { finalizeDeliveredSession, formatReleaseFinalization, formatReleaseHistory, getReleaseHistory } from "./releases.js";
 
+const { version: packageVersion } = JSON.parse(
+  fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")
+);
+
 function usage() {
-  console.log(`SUMI Orchestrator v1.14.3
+  console.log(`SUMI Orchestrator v${packageVersion}
 
 Core:
   sumi continue <project> [--no-sync]
