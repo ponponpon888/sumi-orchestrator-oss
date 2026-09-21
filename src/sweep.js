@@ -13,12 +13,18 @@ import {
 } from "./findings.js";
 import { filterMeaningfulGitChanges, parseGitPorcelain, runCommand } from "./sync.js";
 
-export const SWEEP_OUTCOMES = new Set(["reproduced", "clean", "error", "skipped"]);
+export const SWEEP_OUTCOMES = new Set(["reproduced", "suppressed", "clean", "error", "skipped"]);
 
-// A reproduction attaches itself to a finding that is still open. A closed
-// finding is a historical record: reproducing the problem after it was fixed,
-// dismissed or ruled out is a new finding, not a reopening of the old one.
+// A reproduction attaches itself to a finding that is still open.
 const OPEN_STATUSES = new Set(["suspected", "confirmed"]);
+
+// `dismissed` and `not_applicable` are judgments about the reproduction
+// itself — usually that the check is wrong here. The code reproducing it again
+// is exactly what the judgment anticipated, so the sweep records the run and
+// leaves the ledger alone. `fixed` is the opposite: it is a judgment about the
+// code, and a reproduction after it contradicts that, which is a regression
+// worth its own finding.
+const SUPPRESSING_STATUSES = new Set(["dismissed", "not_applicable"]);
 
 /**
  * `expect` describes what the check prints and returns on a project that does
@@ -150,7 +156,20 @@ function sweepProject(state, pattern, project, { runner, worktreeResolver, dryRu
   };
   const check = { satisfied: true, exitCode: verdict.exitCode, ranAt };
 
-  const open = listFindings(project, { patternKey: pattern.key }).find((item) => OPEN_STATUSES.has(item.status));
+  const filed = listFindings(project, { patternKey: pattern.key });
+  const open = filed.find((item) => OPEN_STATUSES.has(item.status));
+  const suppressed = open ? null : filed.find((item) => SUPPRESSING_STATUSES.has(item.status));
+  if (suppressed) {
+    return recordSweep(project, {
+      ...row,
+      outcome: "suppressed",
+      reproduced: true,
+      findingId: suppressed.id,
+      status: suppressed.status,
+      reason: suppressed.reason
+    }, false);
+  }
+
   let finding;
   if (open) {
     addConfirmation(state, project, open.id, { source, evidence, check });
@@ -223,7 +242,7 @@ export function runSweep(state, {
 }
 
 export function summarizeSweep(outcome) {
-  const totals = { reproduced: 0, clean: 0, error: 0, skipped: 0 };
+  const totals = { reproduced: 0, suppressed: 0, clean: 0, error: 0, skipped: 0 };
   for (const row of outcome.rows) totals[row.outcome] = (totals[row.outcome] || 0) + 1;
   return totals;
 }
@@ -246,14 +265,21 @@ export function formatSweepRun(outcome) {
 
   lines.push(`${pad("PATTERN", 24)} ${pad("PROJECT", 14)} ${pad("OUTCOME", 12)} ${pad("FINDING", 9)} DETAIL`, "-".repeat(72));
   for (const row of outcome.rows) {
-    const detail = row.outcome === "reproduced"
-      ? `${row.status || (row.recorded ? "recorded" : "not recorded")} @ ${String(row.commit).slice(0, 12)}`
-      : row.reason || (row.commit ? `@ ${String(row.commit).slice(0, 12)}` : "");
+    let detail;
+    if (row.outcome === "reproduced") {
+      detail = `${row.status || (row.recorded ? "recorded" : "not recorded")} @ ${String(row.commit).slice(0, 12)}`;
+    } else if (row.outcome === "suppressed") {
+      detail = `${row.findingId} ${row.status}${row.reason ? `: ${row.reason}` : ""}`;
+    } else {
+      detail = row.reason || (row.commit ? `@ ${String(row.commit).slice(0, 12)}` : "");
+    }
     lines.push(`${pad(row.patternKey, 24)} ${pad(row.projectId, 14)} ${pad(row.outcome, 12)} ${pad(row.findingId || "—", 9)} ${detail}`);
   }
   lines.push(
     "",
-    `reproduced ${totals.reproduced} | clean ${totals.clean} | error ${totals.error} | skipped ${totals.skipped}`,
+    `reproduced ${totals.reproduced} | suppressed ${totals.suppressed} | clean ${totals.clean} `
+    + `| error ${totals.error} | skipped ${totals.skipped}`,
+    "suppressed = the check reproduced, but a dismissed or not_applicable finding already answers this cell.",
     "skipped = the pattern does not apply here, or a required service is unregistered (no check was run).",
     "error = the check could not be run against a named commit; nothing was recorded as an answer."
   );

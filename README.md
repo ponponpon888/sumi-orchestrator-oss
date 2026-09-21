@@ -677,7 +677,14 @@ Under `no-output`, output decides, because a linter usually exits non-zero when 
 
 `exit-nonzero` cannot make that distinction: it reads **every** non-zero exit as healthy, so a detector that uses a separate error code — `grep` exits 2 on a bad pattern or an unreadable file — will report that error as a clean project. Prefer `exit-zero` or `no-output` for a check that can fail in more than one way.
 
-A reproduction is filed as a `sweep`-sourced confirmation, which is the one route to R1(a). If an open finding for that pattern already exists it gains a confirmation; a `fixed` or `dismissed` finding is left closed and a new finding is filed instead, so a regression is visible rather than silently reopened.
+A reproduction is filed as a `sweep`-sourced confirmation, which is the one route to R1(a). If an open finding for that pattern already exists it gains a confirmation.
+
+What happens to a closed finding depends on what the closure was a judgment *about*:
+
+- **`dismissed` / `not_applicable`** are judgments about the reproduction — usually that the check is wrong here. The code reproducing it again is exactly what the judgment anticipated, so the run is recorded as `suppressed` and the ledger is left alone. Without this, one imprecise check hands back a fresh `confirmed` finding on every single sweep, and dismissing it never sticks.
+- **`fixed`** is a judgment about the code. A reproduction contradicts it, so a new finding is filed and the regression is visible rather than silently folded into the old record.
+
+An open finding always takes precedence over a dismissed one for the same pattern.
 
 The sweep is fail-closed at every point where it could invent an answer:
 
@@ -688,6 +695,7 @@ The sweep is fail-closed at every point where it could invent an answer:
 | No local path, not a Git worktree, or a **dirty worktree** | `error` | a sweep record only; the cell stays `unknown` |
 | Check timed out, could not start, or died on a signal | `error` | a sweep record only; the cell stays `unknown` |
 | Check ran, did not reproduce | `clean` | a sweep record; **no confirmation** |
+| Check reproduced, but a `dismissed` / `not_applicable` finding already answers the cell | `suppressed` | a sweep record only; the ledger is left alone |
 | Check ran and reproduced | `reproduced` | a finding or a new confirmation, plus the sweep record |
 
 A dirty worktree is refused because evidence is bound to a commit: a result produced from uncommitted edits is not reproducible from the commit that would be recorded beside it.
@@ -739,6 +747,7 @@ The independence of two confirmations is judged **only** by the difference in `s
 - An unregistered service leaves a pattern `unknown` for that project. It is never reported as not applicable.
 - A sweep refuses to run against a dirty worktree, and a sweep that could not run leaves the cell `unknown` rather than `clean`.
 - A sweep that finds nothing records no confirmation, so it can never help confirm the finding it just contradicted.
+- A dismissed finding is not re-filed by the next sweep; only a reproduction after `fixed` opens a new one.
 
 ## Advanced / experimental commands
 
@@ -762,7 +771,7 @@ npm run check
 Current v1 validation target:
 
 ```text
-286 tests passing
+291 tests passing
 syntax checks passing
 ```
 

@@ -55,7 +55,7 @@ test("CLI sweep runs a real check in a real worktree and files what it reproduce
     const dry = sumi("sweep", "--dry-run");
     assert.equal(dry.status, 0, dry.stderr);
     assert.match(dry.stdout, /DRY RUN/);
-    assert.match(dry.stdout, /reproduced 1 \| clean 0/);
+    assert.match(dry.stdout, /reproduced 1 \| suppressed 0 \| clean 0/);
     assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).projects.leaky.findings.length, 0);
 
     // `--project` is read by scanning argv, so its value must not be mistaken
@@ -71,6 +71,18 @@ test("CLI sweep runs a real check in a real worktree and files what it reproduce
     assert.equal(finding.evidence.commit, head);
     assert.equal(finding.confirmations[0].check.exitCode, 3);
     assert.equal(state.projects.leaky.sweeps[0].outcome, "reproduced");
+
+    // A dismissal must survive the next sweep: the check still reproduces, and
+    // re-filing it would hand back a fresh confirmed finding on every run.
+    const dismissed = sumi(
+      "finding", "set-status", "leaky", "F001", "--status", "dismissed",
+      "--reason", "false positive: the check matches its own fixture"
+    );
+    assert.equal(dismissed.status, 0, dismissed.stderr);
+    const again = sumi("sweep", "--project", "leaky");
+    assert.equal(again.status, 0, again.stderr);
+    assert.match(again.stdout, /suppressed\s+F001\s+F001 dismissed/);
+    assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).projects.leaky.findings.length, 1);
 
     // A dirty worktree cannot be bound to a commit, so it answers nothing.
     fs.writeFileSync(path.join(repo, "scripts", "check.mjs"), "process.exit(0);\n");

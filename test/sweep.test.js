@@ -5,7 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createEmptyState, createProject, SERVICE_UNUSED } from "../src/domain.js";
-import { addFinding, addPattern, buildFindingsMatrix, findSweep, getFinding, listFindings } from "../src/findings.js";
+import {
+  addFinding, addPattern, buildFindingsMatrix, findSweep, getFinding, listFindings, setFindingStatus
+} from "../src/findings.js";
 import { evaluateCheckRun, formatSweepRun, resolveSweepWorktree, runSweep, summarizeSweep } from "../src/sweep.js";
 
 const COMMIT = "0123456789abcdef0123456789abcdef01234567";
@@ -120,19 +122,72 @@ test("a second sweep confirms the open finding instead of filing a duplicate", (
   assert.equal(getFinding(project, first.rows[0].findingId).confirmations.length, 2);
 });
 
-test("reproducing a closed finding files a new one rather than reopening it", () => {
+test("a dismissal survives the next sweep instead of being re-filed", () => {
   const { state, project } = setup();
   const pattern = mechanicalPattern(state);
   const first = stubbedSweep(state, ok({ status: 1 }));
-  const finding = getFinding(project, first.rows[0].findingId);
-  finding.status = "dismissed";
-  finding.reason = "accepted risk for this release";
+  setFindingStatus(state, project, first.rows[0].findingId, "dismissed", {
+    reason: "false positive: the check matches the pattern name inside a test title"
+  });
+
+  // The check still reproduces. That is exactly what the dismissal anticipated,
+  // so it must not come back as a fresh confirmed finding on every run.
+  const second = stubbedSweep(state, ok({ status: 1 }));
+  assert.equal(second.rows[0].outcome, "suppressed");
+  assert.equal(second.rows[0].findingId, first.rows[0].findingId);
+  assert.equal(second.rows[0].status, "dismissed");
+  assert.equal(listFindings(project, { patternKey: pattern.key }).length, 1);
+  assert.equal(getFinding(project, first.rows[0].findingId).confirmations.length, 1);
+
+  const third = stubbedSweep(state, ok({ status: 1 }));
+  assert.equal(third.rows[0].outcome, "suppressed");
+  assert.equal(listFindings(project, { patternKey: pattern.key }).length, 1);
+  assert.equal(findSweep(project, pattern.key).outcome, "suppressed");
+});
+
+test("not_applicable suppresses the same way a dismissal does", () => {
+  const { state, project } = setup({ supabase: SERVICE_UNUSED });
+  const pattern = mechanicalPattern(state);
+  const first = stubbedSweep(state, ok({ status: 1 }));
+  setFindingStatus(state, project, first.rows[0].findingId, "not_applicable", {
+    reason: "this project does not expose the affected surface"
+  });
 
   const second = stubbedSweep(state, ok({ status: 1 }));
+  assert.equal(second.rows[0].outcome, "suppressed");
+  assert.equal(listFindings(project, { patternKey: pattern.key }).length, 1);
+});
+
+test("a reproduction after fixed is a regression and files a new finding", () => {
+  const { state, project } = setup();
+  const pattern = mechanicalPattern(state);
+  const first = stubbedSweep(state, ok({ status: 1 }));
+  // `fixed` is a judgment about the code; reproducing it again contradicts that.
+  getFinding(project, first.rows[0].findingId).status = "fixed";
+
+  const second = stubbedSweep(state, ok({ status: 1 }));
+  assert.equal(second.rows[0].outcome, "reproduced");
   assert.notEqual(second.rows[0].findingId, first.rows[0].findingId);
-  assert.equal(getFinding(project, first.rows[0].findingId).status, "dismissed");
   assert.equal(getFinding(project, second.rows[0].findingId).status, "confirmed");
   assert.equal(listFindings(project, { patternKey: pattern.key }).length, 2);
+});
+
+test("an open finding still wins over a dismissed one for the same pattern", () => {
+  const { state, project } = setup();
+  const pattern = mechanicalPattern(state);
+  const first = stubbedSweep(state, ok({ status: 1 }));
+  setFindingStatus(state, project, first.rows[0].findingId, "dismissed", { reason: "not this one" });
+  const open = addFinding(state, project, {
+    title: "a human found it for real",
+    patternKey: pattern.key,
+    source: { kind: "human" },
+    evidence: { commit: COMMIT }
+  });
+
+  const second = stubbedSweep(state, ok({ status: 1 }));
+  assert.equal(second.rows[0].outcome, "reproduced");
+  assert.equal(second.rows[0].findingId, open.id);
+  assert.equal(getFinding(project, open.id).status, "confirmed");
 });
 
 test("a clean run records no confirmation, so it cannot supply R1's second source kind", () => {
@@ -272,7 +327,7 @@ test("every mechanical pattern is swept in every project when none is named", ()
 
   const outcome = stubbedSweep(state, ok({ status: 0 }));
   assert.equal(outcome.rows.length, 4);
-  assert.deepEqual(summarizeSweep(outcome), { reproduced: 0, clean: 4, error: 0, skipped: 0 });
+  assert.deepEqual(summarizeSweep(outcome), { reproduced: 0, suppressed: 0, clean: 4, error: 0, skipped: 0 });
 });
 
 test("resolveSweepWorktree refuses a dirty worktree and accepts a clean one", () => {
