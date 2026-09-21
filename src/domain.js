@@ -49,6 +49,7 @@ export function createProject({ id, name, repo = null, local = null, vercel = nu
     sessions: [],
     releases: [],
     findings: [],
+    sweeps: [],
     deployment: {
       branch: null,
       commit: null,
@@ -76,6 +77,9 @@ export function ensureProjectShape(project) {
   if (!Array.isArray(project.sessions)) project.sessions = [];
   if (!Array.isArray(project.releases)) project.releases = [];
   if (!Array.isArray(project.findings)) project.findings = [];
+  // A per-project array needs no schema bump: an older SUMI ignores it and a
+  // state written before it existed is backfilled here on load.
+  if (!Array.isArray(project.sweeps)) project.sweeps = [];
   for (const finding of project.findings) {
     // `confirmations` is part of the finding schema, not an optional extra: a
     // finding written before it existed still carries exactly one record — the

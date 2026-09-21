@@ -151,6 +151,20 @@ export function ensureFindingsShape(project) {
   return project.findings;
 }
 
+export function ensureSweepsShape(project) {
+  if (!Array.isArray(project.sweeps)) project.sweeps = [];
+  return project.sweeps;
+}
+
+/**
+ * The most recent sweep of one pattern in one project. It answers "was this
+ * checked, and what did the check see", which a finding cannot: a project with
+ * no finding has either never been swept or been swept and found clean.
+ */
+export function findSweep(project, patternKey) {
+  return ensureSweepsShape(project).find((item) => item.patternKey === patternKey) || null;
+}
+
 function nextPatternId(patterns) {
   const seq = patterns.reduce((max, item) => Math.max(max, Number(String(item.id || "").slice(1)) || 0), 0) + 1;
   return `P${String(seq).padStart(3, "0")}`;
@@ -458,8 +472,17 @@ export function buildFindingsMatrix(state, { patternKey = null } = {}) {
         };
       }
       const applicability = getPatternApplicability(project, pattern);
-      // No finding means no answer yet. R7 forbids reading "unregistered" as "n/a".
-      const status = applicability.applicable === "no" ? "n/a" : "unknown";
+      const sweep = findSweep(project, pattern.key);
+      // No finding means no answer yet, unless a sweep looked and found nothing.
+      // R7 forbids reading "unregistered" as "n/a", and a sweep that could not
+      // run is still "unknown" — only a completed clean run answers the cell.
+      let status = "unknown";
+      let reason = applicability.reason;
+      if (applicability.applicable === "no") status = "n/a";
+      else if (sweep?.outcome === "clean") {
+        status = "clean";
+        reason = `swept ${sweep.ranAt} @ ${String(sweep.commit).slice(0, 12)}`;
+      } else if (sweep?.outcome === "error") reason = `sweep error: ${sweep.reason}`;
       return {
         projectId: project.id,
         status,
@@ -467,7 +490,7 @@ export function buildFindingsMatrix(state, { patternKey = null } = {}) {
         counts: {},
         cell: status,
         findings: [],
-        reason: applicability.reason
+        reason
       };
     })
   }));
@@ -559,6 +582,7 @@ export function formatFindingsMatrix(matrix) {
   lines.push(
     "",
     "unknown = not checked yet, or a required service is unregistered. n/a = a required service is recorded as unused.",
+    "clean = a sweep ran the pattern's check against a named commit here and did not reproduce it.",
     "status (n) = n finding(s) recorded here; the status shown is the loudest one."
   );
   return lines.join("\n");

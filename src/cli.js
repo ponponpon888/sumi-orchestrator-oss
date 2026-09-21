@@ -44,6 +44,7 @@ import {
   formatPattern, formatPatterns, getFinding, getPattern, listFindings, listPatterns, promoteFinding, removePattern,
   setFindingStatus, setPattern
 } from "./findings.js";
+import { formatSweepRun, runSweep, summarizeSweep } from "./sweep.js";
 
 const { version: packageVersion } = JSON.parse(
   fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")
@@ -126,6 +127,10 @@ Cross-project bug hunt:
       confirmed needs a sweep-reproduced check or two different source kinds; fixed is
       derived from delivery evidence and cannot be asserted by hand.
   sumi finding promote <project> <findingId>
+  sumi sweep [<pattern-key>] [--pattern <key>] [--project <id>] [--dry-run]
+      Runs each mechanical pattern's check in every registered project's clean
+      worktree and files what it reproduces as a sweep-sourced confirmation.
+      A pattern whose required service is unregistered is skipped, not answered.
 
 Advanced:
   sumi doctor <project>
@@ -182,6 +187,21 @@ function project(id) {
 function option(name) {
   const idx = argv.indexOf(`--${name}`);
   return idx >= 0 ? argv[idx + 1] : undefined;
+}
+
+/**
+ * parseArgs runs with strict:false, so the value of an unknown flag lands in
+ * the positionals. Reading an optional positional straight out of argv keeps
+ * `sumi sweep --project musubu` from being read as a pattern named "musubu".
+ */
+function positionalAfter(command) {
+  const idx = argv.indexOf(command);
+  if (idx < 0) return undefined;
+  // The match may itself be some earlier flag's value rather than the command.
+  const previous = argv[idx - 1];
+  if (previous && previous.startsWith("--") && !previous.includes("=")) return undefined;
+  const next = argv[idx + 1];
+  return next && !next.startsWith("--") ? next : undefined;
 }
 
 function persist(kind, details = {}) {
@@ -857,6 +877,23 @@ try {
     const outcome = promoteFinding(state, p, b);
     persist("finding.promote", { projectId: a, findingId: outcome.finding.id, criterionId: outcome.criterion.id });
     console.log(`${outcome.finding.id} -> ${outcome.criterion.id}: ${outcome.criterion.text}`);
+  } else if (group === "sweep") {
+    const dryRun = argv.includes("--dry-run");
+    const projectId = option("project") ?? null;
+    const outcome = runSweep(state, {
+      patternKey: positionalAfter("sweep") ?? option("pattern") ?? null,
+      projectIds: projectId ? [projectId] : null,
+      dryRun
+    });
+    if (!dryRun) {
+      persist("sweep.run", {
+        patterns: outcome.patterns.map((pattern) => pattern.key),
+        projects: outcome.projects.map((item) => item.id),
+        totals: summarizeSweep(outcome),
+        findings: outcome.rows.filter((row) => row.findingId).map((row) => `${row.projectId}:${row.findingId}`)
+      });
+    }
+    console.log(formatSweepRun(outcome));
   } else if (group === "task" && action === "add") {
     const p = project(a);
     const title = b;
