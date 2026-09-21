@@ -14,9 +14,10 @@ export function normalizeProjectPriority(value, fallback = 3) {
 
 export function createEmptyState() {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision: 0,
     updatedAt: new Date().toISOString(),
+    patterns: [],
     projects: {}
   };
 }
@@ -47,6 +48,7 @@ export function createProject({ id, name, repo = null, local = null, vercel = nu
     agentResults: [],
     sessions: [],
     releases: [],
+    findings: [],
     deployment: {
       branch: null,
       commit: null,
@@ -73,6 +75,17 @@ export function ensureProjectShape(project) {
   if (!Array.isArray(project.agentResults)) project.agentResults = [];
   if (!Array.isArray(project.sessions)) project.sessions = [];
   if (!Array.isArray(project.releases)) project.releases = [];
+  if (!Array.isArray(project.findings)) project.findings = [];
+  for (const finding of project.findings) {
+    // `confirmations` is part of the finding schema, not an optional extra: a
+    // finding written before it existed still carries exactly one record — the
+    // one it was created with. Leaving it undefined would make the confirmation
+    // rule throw instead of refusing.
+    if (!finding || typeof finding !== "object" || Array.isArray(finding.confirmations)) continue;
+    finding.confirmations = finding.source && finding.evidence
+      ? [{ source: finding.source, evidence: finding.evidence, check: null, recordedAt: finding.createdAt || null }]
+      : [];
+  }
   project.priority = normalizeProjectPriority(project.priority, 3);
   return project;
 }

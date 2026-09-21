@@ -33,6 +33,7 @@ The v1 workflow is intentionally narrow:
 - `release-queue` — require fresh session-specific GitHub PR/CI/review/mergeability evidence before a release decision
 - `delivery-queue` — track the certified PR after merge through the exact production deployment and explicit verification
 - `releases` — preserve finalized delivery history across projects after scope/session lifecycle closure
+- `pattern` / `finding` / `findings` — keep a bug found in one project as a question asked of every project, with fail-closed rules for when an answer may be called confirmed or fixed
 - project priority (`P1`–`P5`) — rank portfolio work before queue and batch assignment
 
 Browser automation and direct agent dispatch remain advanced/experimental. They are not required for the v1 workflow.
@@ -61,6 +62,10 @@ SUMI stores project state outside the source repository:
 ```
 
 State files are migrated under an exclusive lock. Before an older schema is replaced, SUMI preserves the previous valid file as `state.json.bak`. A state created by a newer unsupported SUMI version is rejected instead of being silently rolled back.
+
+The current state schema is **3**. Migrating a schema 2 state adds the top-level pattern ledger; per-project finding lists are filled in on load. No existing field is rewritten or removed.
+
+A state that has been raised to schema 3 can no longer be read by an older SUMI that does not know schema 3. That refusal is deliberate, and it is one-way: once any command has saved the state, the pre-migration file survives only as the single `state.json.bak`, which the next save overwrites. Take a named copy before upgrading if you may need to go back, and point verification runs at a throwaway file with `--data` while a schema change is still unmerged.
 
 Updating SUMI therefore does not erase registered project state.
 
@@ -584,6 +589,91 @@ SUMI TRADE        —   UNSCOPED  GitHub ActionsのCI失敗原因を確認して
 
 `UNSCOPED` means the completion Scope is empty, so no percentage can exist. Projects with configuration gaps are listed under `SETUP REQUIRED` in `sumi queue`, separately from dispatchable work, and they are never numbered, so `queue --prompt <number>` keeps pointing at the same item.
 
+## Cross-project bug hunt: patterns and findings
+
+A bug found in one project is usually a question worth asking of every project. `pattern` and `finding` keep that question and its answers as a ledger instead of leaving them in a chat log.
+
+**This release ships the ledger and its rules only.** Running the checks (`sweep`) and generating the per-project questions are deliberately left to a later change; nothing here executes a check or contacts a repository.
+
+A **pattern** is the reusable question. A **finding** is one project's answer to it.
+
+```powershell
+sumi pattern add supabase-rls-off `
+  --title "A public table has RLS disabled" `
+  --question "Does every public table have row level security enabled?" `
+  --origin "musubu:F014" `
+  --severity high `
+  --requires supabase `
+  --check "node scripts/check-rls.mjs" --check-expect exit-zero --check-timeout-ms 30000
+
+sumi pattern list
+sumi pattern show supabase-rls-off
+```
+
+`--origin` records where the question came from and accepts only three forms, so every pattern stays traceable to something a reader can open: `<project>:<findingId>`, `record`, or `<path>#<anchor>`.
+
+A pattern with a `--check` is `mechanical`; without one it is a `judgment` question that a reader has to answer by looking at the code. `--requires` limits a pattern to projects that use a given service (`supabase`, `vercel`).
+
+Record what a given project turned out to be:
+
+```powershell
+sumi finding add client `
+  --pattern supabase-rls-off `
+  --title "public.orders has RLS off" `
+  --source-kind agent --agent claude-code `
+  --commit 0123456789abcdef0123456789abcdef01234567 `
+  --files "supabase/migrations/0007_orders.sql" `
+  --output "no ENABLE ROW LEVEL SECURITY for public.orders"
+
+sumi finding list client
+sumi finding show client F001
+```
+
+Every finding requires a commit: evidence that cannot be re-checked later is not evidence. Long output is truncated to 4096 characters and flagged with `truncated`, never silently dropped.
+
+See the whole portfolio at once:
+
+```powershell
+sumi findings
+sumi findings --pattern supabase-rls-off
+```
+
+```text
+SUMI FINDINGS — 2 pattern(s) x 3 project(s)
+============================================================================================
+PATTERN                  SEV     hanami              client             musubu
+--------------------------------------------------------------------------------------------
+supabase-rls-off         high    n/a                 suspected (2)       unknown
+unsigned-webhook         high    unknown             unknown             confirmed
+
+unknown = not checked yet, or a required service is unregistered. n/a = a required service is recorded as unused.
+status (n) = n finding(s) recorded here; the status shown is the loudest one.
+```
+
+The table never leaves a cell blank. `unknown` means SUMI has no answer yet — including when a required service is merely **unregistered**. `n/a` appears only when the project has explicitly recorded that service as `none`. An unregistered service is an open question, not an irrelevant one, and SUMI will not rewrite one as the other. When several findings sit behind one cell, the loudest status is shown with the total count, so a `fixed` finding cannot hide a `suspected` one.
+
+### The rules
+
+A finding's status is not a free-text field. Each transition is refused unless the evidence exists:
+
+- **suspected → confirmed** requires either a mechanical check that the sweep itself reproduced, or confirmations from two different `source.kind`s. An agent reporting its own conclusion — however many times — stays `suspected`.
+- **not_applicable / dismissed** require a non-empty reason. An empty string is refused.
+- **not_applicable** is additionally refused while a required service is unregistered, because that state is unknown rather than irrelevant.
+- **promote** accepts only a `confirmed` finding. It creates one ordinary scope criterion and links it back through `finding.scopeId`; it opens no new execution path, so promoted work flows through the existing route/queue/session pipeline.
+- **fixed** is derived, never asserted: the promoted scope criterion must be `done` and a session on that criterion must carry a delivery merge commit. `fixedBy` is read out of that session's delivery evidence, not from a command-line flag.
+
+```powershell
+sumi finding set-status client F001 --status confirmed `
+  --source-kind human --commit 0123456789abcdef0123456789abcdef01234567
+sumi finding promote client F001
+```
+
+Passing a source and commit to `set-status` records one more confirmation before the rule is applied. There is deliberately no flag for recording a check result by hand — see below.
+
+### Not closed
+
+The independence of two confirmations is judged **only** by the difference in `source.kind`. One operator who reports the same finding twice under two different kinds will pass the rule. This is not closed.
+
 ## Safety principles
 
 - Observation is read-only by default.
@@ -600,6 +690,9 @@ SUMI TRADE        —   UNSCOPED  GitHub ActionsのCI失敗原因を確認して
 - Release Gate uses session-specific PR/HEAD evidence and expires external GitHub evidence instead of trusting old CI/review state.
 - Delivery Gate binds post-merge production evidence and explicit verification to the exact certified PR head and merge commit.
 - Delivery finalization never deletes a dirty worktree and preserves a release-history snapshot before closing the lifecycle.
+- A finding is `confirmed` only on reproduced or independently corroborated evidence; an agent's own report keeps it `suspected`.
+- A finding is `fixed` only when delivery evidence says so; there is no command that marks one fixed by assertion.
+- An unregistered service leaves a pattern `unknown` for that project. It is never reported as not applicable.
 
 ## Advanced / experimental commands
 
@@ -623,7 +716,7 @@ npm run check
 Current v1 validation target:
 
 ```text
-246 tests passing
+270 tests passing
 syntax checks passing
 ```
 

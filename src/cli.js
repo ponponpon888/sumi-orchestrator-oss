@@ -39,6 +39,11 @@ import { formatMergeQueue, formatMergeReadiness, getMergeQueue, getMergeReadines
 import { formatReleaseQueue, formatReleaseReadiness, getReleaseQueue, getReleaseReadiness, recordReleaseGate, syncReleaseEvidence } from "./release.js";
 import { formatDeliveryQueue, formatDeliveryReadiness, getDeliveryQueue, getDeliveryReadiness, syncDeliveryEvidence, verifyDelivery } from "./delivery.js";
 import { finalizeDeliveredSession, formatReleaseFinalization, formatReleaseHistory, getReleaseHistory } from "./releases.js";
+import {
+  addFinding, addPattern, buildFindingsMatrix, findPattern, formatFinding, formatFindings, formatFindingsMatrix,
+  formatPattern, formatPatterns, getFinding, getPattern, listFindings, listPatterns, promoteFinding, removePattern,
+  setFindingStatus, setPattern
+} from "./findings.js";
 
 const { version: packageVersion } = JSON.parse(
   fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")
@@ -98,6 +103,29 @@ Project setup:
   sumi scope set <project> <criterionId> --status todo|doing|blocked|done|cancelled
   sumi scope suggest <project> [--apply]
   sumi scope review <project> [--apply]
+
+Cross-project bug hunt:
+  sumi findings [--pattern <key>]
+  sumi pattern list
+  sumi pattern add <key> --title <title> --question <question> --origin <origin>
+      [--severity high|medium|low] [--requires supabase,vercel]
+      [--check "<argv>"] [--check-expect exit-zero|exit-nonzero|no-output] [--check-timeout-ms n]
+      origin is "<project>:<findingId>", "record", or "<path>#<anchor>".
+      A pattern with a --check is mechanical; without one it is a judgment question.
+  sumi pattern show <key>
+  sumi pattern set <key> [--title t] [--question q] [--origin o] [--severity s] [--requires list|none] [--check "<argv>"|none]
+  sumi pattern remove <key>
+  sumi finding add <project> --title <title> --source-kind sweep|agent|human --commit <sha>
+      [--pattern <key>] [--detail text] [--severity high|medium|low]
+      [--agent name] [--session id] [--files a,b] [--output text]
+  sumi finding list <project> [--pattern <key>] [--status suspected|confirmed|not_applicable|fixed|dismissed]
+  sumi finding show <project> <findingId>
+  sumi finding set-status <project> <findingId> --status <status> [--reason text]
+      [--source-kind kind --commit sha [--agent name] [--session id] [--files a,b] [--output text]]
+      Passing a source and commit records one more confirmation before the rule is applied.
+      confirmed needs a sweep-reproduced check or two different source kinds; fixed is
+      derived from delivery evidence and cannot be asserted by hand.
+  sumi finding promote <project> <findingId>
 
 Advanced:
   sumi doctor <project>
@@ -159,6 +187,41 @@ function option(name) {
 function persist(kind, details = {}) {
   saveState(state, dataPath);
   appendAudit({ kind, ...details }, dataPath);
+}
+
+/**
+ * `--check "node scripts/check-rls.mjs"` is split on whitespace; a JSON array is
+ * accepted for arguments that contain spaces. `none` clears an existing check.
+ */
+function checkFromOptions() {
+  const raw = option("check");
+  if (raw === undefined) return undefined;
+  if (raw === "none") return null;
+  const trimmed = String(raw).trim();
+  return {
+    argv: trimmed.startsWith("[") ? JSON.parse(trimmed) : trimmed.split(/\s+/).filter(Boolean),
+    cwd: option("check-cwd") ?? "repo",
+    timeoutMs: option("check-timeout-ms") === undefined ? 60000 : Number(option("check-timeout-ms")),
+    expect: option("check-expect") ?? "exit-zero"
+  };
+}
+
+function appliesToFromOptions() {
+  const raw = option("requires");
+  if (raw === undefined) return undefined;
+  return raw === "none" ? null : { requires: raw };
+}
+
+function sourceFromOptions() {
+  const kind = option("source-kind");
+  if (!kind) return null;
+  return { kind, agent: option("agent") ?? undefined, sessionId: option("session") ?? undefined };
+}
+
+function evidenceFromOptions() {
+  const commit = option("commit");
+  if (!commit) return null;
+  return { commit, files: option("files") ?? [], output: option("output") ?? "", checkedAt: option("checked-at") };
 }
 
 async function readAgentResultText() {
@@ -718,6 +781,82 @@ try {
         console.log("\nNo high-confidence status changes to apply.");
       }
     }
+  } else if (group === "findings") {
+    console.log(formatFindingsMatrix(buildFindingsMatrix(state, { patternKey: option("pattern") ?? null })));
+  } else if (group === "pattern" && action === "list") {
+    console.log(formatPatterns(listPatterns(state)));
+  } else if (group === "pattern" && action === "add") {
+    const pattern = addPattern(state, {
+      key: a,
+      title: option("title"),
+      question: option("question"),
+      origin: option("origin"),
+      severity: option("severity") ?? "medium",
+      check: checkFromOptions() ?? null,
+      appliesTo: appliesToFromOptions() ?? null
+    });
+    persist("pattern.add", { patternId: pattern.id, key: pattern.key, kind: pattern.kind, origin: pattern.origin });
+    console.log(`Added ${pattern.id}: ${pattern.key}`);
+  } else if (group === "pattern" && action === "show") {
+    console.log(formatPattern(getPattern(state, a)));
+  } else if (group === "pattern" && action === "set") {
+    const patch = {};
+    for (const key of ["title", "question", "origin", "severity"]) {
+      const value = option(key);
+      if (value !== undefined) patch[key] = value;
+    }
+    const check = checkFromOptions();
+    if (check !== undefined) patch.check = check;
+    const appliesTo = appliesToFromOptions();
+    if (appliesTo !== undefined) patch.appliesTo = appliesTo;
+    const pattern = setPattern(state, a, patch);
+    persist("pattern.set", { patternId: pattern.id, key: pattern.key, fields: Object.keys(patch) });
+    console.log(`Updated ${pattern.id}: ${pattern.key}`);
+  } else if (group === "pattern" && action === "remove") {
+    const pattern = removePattern(state, a);
+    persist("pattern.remove", { patternId: pattern.id, key: pattern.key });
+    console.log(`Removed ${pattern.id}: ${pattern.key}`);
+  } else if (group === "finding" && action === "add") {
+    const p = project(a);
+    const source = sourceFromOptions();
+    if (!source) throw new Error("--source-kind is required for finding add (sweep|agent|human).");
+    const evidence = evidenceFromOptions();
+    if (!evidence) throw new Error("--commit is required for finding add; evidence without a commit cannot be re-checked later.");
+    const finding = addFinding(state, p, {
+      title: option("title"),
+      patternKey: option("pattern") ?? null,
+      detail: option("detail") ?? "",
+      severity: option("severity") ?? null,
+      source,
+      evidence
+    });
+    persist("finding.add", { projectId: a, findingId: finding.id, patternKey: finding.patternKey, status: finding.status, sourceKind: finding.source.kind });
+    console.log(`Added ${finding.id} [${finding.status}]: ${finding.title}`);
+  } else if (group === "finding" && action === "list") {
+    const p = project(a);
+    console.log(formatFindings(p, listFindings(p, { patternKey: option("pattern") ?? null, status: option("status") ?? null })));
+  } else if (group === "finding" && action === "show") {
+    const p = project(a);
+    const finding = getFinding(p, b);
+    console.log(formatFinding(p, finding, finding.patternKey ? findPattern(state, finding.patternKey) : null));
+  } else if (group === "finding" && action === "set-status") {
+    const p = project(a);
+    const source = sourceFromOptions();
+    const evidence = evidenceFromOptions();
+    if (Boolean(source) !== Boolean(evidence)) {
+      throw new Error("A confirmation needs both --source-kind and --commit; pass both or neither.");
+    }
+    const finding = setFindingStatus(state, p, b, option("status"), {
+      reason: option("reason") ?? null,
+      confirmation: source ? { source, evidence } : null
+    });
+    persist("finding.set-status", { projectId: a, findingId: finding.id, status: finding.status, reason: finding.reason, fixedBy: finding.fixedBy });
+    console.log(`${finding.id} -> ${finding.status}${finding.reason ? ` (${finding.reason})` : ""}`);
+  } else if (group === "finding" && action === "promote") {
+    const p = project(a);
+    const outcome = promoteFinding(state, p, b);
+    persist("finding.promote", { projectId: a, findingId: outcome.finding.id, criterionId: outcome.criterion.id });
+    console.log(`${outcome.finding.id} -> ${outcome.criterion.id}: ${outcome.criterion.text}`);
   } else if (group === "task" && action === "add") {
     const p = project(a);
     const title = b;

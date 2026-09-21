@@ -7,7 +7,7 @@ import { createEmptyState, ensureProjectShape } from "./domain.js";
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const DEFAULT_STALE_LOCK_MS = 10 * 60_000;
 const LOCK_RETRY_MS = 50;
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 class UnsupportedSchemaError extends Error {
   constructor(message) {
@@ -24,7 +24,13 @@ function migrateV1ToV2(state) {
   return { ...state, schemaVersion: 2, revision: 0 };
 }
 
-const migrations = new Map([[1, migrateV1ToV2]]);
+function migrateV2ToV3(state) {
+  // v3 adds the cross-project pattern ledger. Per-project findings are filled
+  // in by ensureProjectShape, so the migration only has to open the top level.
+  return { ...state, schemaVersion: 3, patterns: Array.isArray(state.patterns) ? state.patterns : [] };
+}
+
+const migrations = new Map([[1, migrateV1ToV2], [2, migrateV2ToV3]]);
 
 function migrateState(state, filePath) {
   const sourceVersion = state?.schemaVersion;
@@ -51,6 +57,7 @@ function parseState(raw, filePath) {
   if (!state.projects || typeof state.projects !== "object" || Array.isArray(state.projects) || !Number.isInteger(state.revision) || state.revision < 0) {
     throw new Error(`Unsupported or invalid SUMI state: ${filePath}`);
   }
+  if (!Array.isArray(state.patterns)) state.patterns = [];
   for (const project of Object.values(state.projects)) ensureProjectShape(project);
   return state;
 }
