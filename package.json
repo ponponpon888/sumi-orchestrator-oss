@@ -3,6 +3,24 @@
   "version": "1.16.1",
   "private": true,
   "description": "Development state orchestrator for AI-assisted software projects.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ponponpon888/sumi-orchestrator-oss.git"
+  },
+  "keywords": [
+    "orchestrator",
+    "cli",
+    "developer-tools",
+    "ai-assisted-development",
+    "development-state",
+    "git",
+    "github",
+    "ci",
+    "vercel",
+    "supabase",
+    "local-first"
+  ],
   "type": "module",
   "bin": {
     "sumi": "./src/cli.js"
