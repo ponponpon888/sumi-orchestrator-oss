@@ -7,3 +7,4 @@ state.json
 audit.jsonl
 *.tmp
 *.log
+examples/*.bak

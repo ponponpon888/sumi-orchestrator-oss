@@ -1,7 +1,7 @@
 {
-  "schemaVersion": 2,
-  "revision": 0,
-  "updatedAt": "2026-09-11T00:00:00.000Z",
+  "schemaVersion": 3,
+  "revision": 1,
+  "updatedAt": "2026-10-14T09:19:51.190Z",
   "projects": {
     "musubu-doboku": {
       "id": "musubu-doboku",
@@ -13,21 +13,83 @@
       "lifecycle": "active",
       "summary": "土木向けMUSUBU",
       "tasks": [
-        {"id":"T001","seq":1,"title":"認証","status":"done","createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:00:00Z"},
-        {"id":"T002","seq":2,"title":"テナント分離","status":"done","createdAt":"2026-09-02T00:00:00Z","updatedAt":"2026-09-02T00:00:00Z"},
-        {"id":"T003","seq":3,"title":"LINE通知E2E","status":"doing","createdAt":"2026-09-10T00:00:00Z","updatedAt":"2026-09-10T00:00:00Z"},
-        {"id":"T004","seq":4,"title":"本番スマホ確認","status":"todo","createdAt":"2026-09-10T00:00:00Z","updatedAt":"2026-09-10T00:00:00Z"}
+        {
+          "id": "T001",
+          "seq": 1,
+          "title": "認証",
+          "status": "done",
+          "createdAt": "2026-09-01T00:00:00Z",
+          "updatedAt": "2026-09-01T00:00:00Z"
+        },
+        {
+          "id": "T002",
+          "seq": 2,
+          "title": "テナント分離",
+          "status": "done",
+          "createdAt": "2026-09-02T00:00:00Z",
+          "updatedAt": "2026-09-02T00:00:00Z"
+        },
+        {
+          "id": "T003",
+          "seq": 3,
+          "title": "LINE通知E2E",
+          "status": "doing",
+          "createdAt": "2026-09-10T00:00:00Z",
+          "updatedAt": "2026-09-10T00:00:00Z"
+        },
+        {
+          "id": "T004",
+          "seq": 4,
+          "title": "本番スマホ確認",
+          "status": "todo",
+          "createdAt": "2026-09-10T00:00:00Z",
+          "updatedAt": "2026-09-10T00:00:00Z"
+        }
       ],
       "decisions": [
-        {"id":"D001","text":"予約系ツールは土木テナントから除外","reason":"存在しない予約メニューをAIが探索する誤動作を防ぐため","createdAt":"2026-09-07T00:00:00Z"}
+        {
+          "id": "D001",
+          "text": "予約系ツールは土木テナントから除外",
+          "reason": "存在しない予約メニューをAIが探索する誤動作を防ぐため",
+          "createdAt": "2026-09-07T00:00:00Z"
+        }
       ],
       "nextActions": [
-        {"id":"N001","text":"LINE通知のE2E検証","done":false,"createdAt":"2026-09-10T00:00:00Z"},
-        {"id":"N002","text":"スマホ本番確認","done":false,"createdAt":"2026-09-10T00:00:00Z"}
+        {
+          "id": "N001",
+          "text": "LINE通知のE2E検証",
+          "done": false,
+          "createdAt": "2026-09-10T00:00:00Z"
+        },
+        {
+          "id": "N002",
+          "text": "スマホ本番確認",
+          "done": false,
+          "createdAt": "2026-09-10T00:00:00Z"
+        }
       ],
-      "deployment": {"branch":"main","commit":null,"pr":86,"ci":"ready","preview":"ready","production":"pending","productionCheckedAt":null},
-      "createdAt":"2026-09-01T00:00:00Z",
-      "updatedAt":"2026-09-10T00:00:00Z"
+      "deployment": {
+        "branch": "main",
+        "commit": null,
+        "pr": 86,
+        "ci": "ready",
+        "preview": "ready",
+        "production": "pending",
+        "productionCheckedAt": null
+      },
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-10T00:00:00Z",
+      "scope": {
+        "title": "Project completion",
+        "criteria": []
+      },
+      "agentResults": [],
+      "sessions": [],
+      "releases": [],
+      "findings": [],
+      "sweeps": [],
+      "priority": 3
     }
-  }
+  },
+  "patterns": []
 }
