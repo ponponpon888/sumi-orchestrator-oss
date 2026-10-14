@@ -1,18 +1,104 @@
-# SUMI Orchestrator v1.15.1
+# SUMI Orchestrator
 
-SUMI is a local-first development-state orchestrator for AI-assisted software projects.
+A local-first CLI that keeps the development state of AI-assisted software projects coherent across Git, GitHub/CI, Vercel, and Supabase.
 
-> **v1.14.3 reliability patch:** blocker-first result ingestion and routing now place actionable remediation/ready work ahead of blocked or waiting gates; sync now preserves stored Production verification, aggregates current-main baseline CI, and avoids non-actionable empty Preview warnings for completed releases.
->
-> **v1.14.2 routing hotfix:** `GitHub Billing / spending limit` wording now classifies as the existing `ci-billing` gate even when the criterion text omits `Actions` or `CI`, so account-level blockers route to `human / action` instead of the default coding agent.
->
-> **v1.14.1 Windows hotfix:** Review Gate now launches npm `.cmd` shims through `cmd.exe` safely on Windows, and cross-platform worktree path assertions are normalized. No state schema migration is required.
+It exists to answer three questions that AI-assisted work keeps re-asking:
 
-It does **not** replace Claude Code, Codex, GitHub, Vercel, or Supabase. Its job is to keep the development state coherent across them:
+- **"Where did this project stop?"** — the state lives in a ledger on disk, not in a chat log that has scrolled away.
+- **"Is this actually done?"** — progress comes only from explicit completion criteria, and `done` requires evidence that can be re-checked later.
+- **"Which project should I touch next?"** — one prioritized queue across every registered project, with human-owned blockers separated from agent-ready work.
+
+SUMI does **not** replace Claude Code, Codex, GitHub, Vercel, or Supabase. Its job is the loop between them:
 
 > observe → define completion → decide NEXT → route work → ingest result → preserve evidence → hand off
 
-## v1 MVP
+## Try it in one minute
+
+There are no dependencies to install before seeing output — the repository ships a bundled example state:
+
+```powershell
+git clone https://github.com/ponponpon888/sumi-orchestrator-oss.git
+cd sumi-orchestrator-oss
+npm run demo
+```
+
+```text
+SUMI DASHBOARD
+========================================================================
+PROJECT              PRI  PROG  STATE    NEXT
+------------------------------------------------------------------------
+musubu-doboku        P3     —   DOING    LINE通知のE2E検証
+```
+
+`PROG` is `—` because that example project has no explicit completion Scope yet, so no percentage can honestly exist. That refusal to guess is the point of the tool.
+
+## Install
+
+```powershell
+npm link
+sumi init
+```
+
+Run both from the directory you cloned into; SUMI does not care where that is. `npm link` puts the `sumi` command on your PATH, and `sumi init` creates the state file.
+
+## Requirements
+
+- Windows 11 recommended
+- Node.js 20+
+- Git
+- GitHub CLI (`gh`) for GitHub observation
+- Vercel CLI only for projects using Vercel
+- Supabase CLI only for projects using Supabase
+
+## Where state lives
+
+SUMI stores project state outside the source repository:
+
+```text
+%USERPROFILE%\.sumi\state.json
+```
+
+Updating SUMI therefore does not erase registered project state.
+
+State files are migrated under an exclusive lock. Before an older schema is replaced, SUMI preserves the previous valid file as `state.json.bak`. A state created by a newer unsupported SUMI version is rejected instead of being silently rolled back.
+
+Schema migration is one-way: once any command has saved the state, the pre-migration file survives only as the single `state.json.bak`, which the next save overwrites. A migrated state can no longer be read by an older SUMI that does not know the newer schema, and that refusal is deliberate. Take a named copy before upgrading if you may need to go back, and point verification runs at a throwaway file with `--data` while a schema change is still unmerged.
+
+## Daily entry point
+
+Use `continue` when resuming a project:
+
+```powershell
+sumi continue musubu
+```
+
+Typical output:
+
+```text
+SUMI CONTINUE — MUSUBU
+========================================================================
+Progress: 33% (2/6 scope)
+Branch: fix/login-session-timeout
+PR: 42
+CI: failed
+Worktree: clean
+
+BLOCKERS
+  ! C006 GitHub Billing / spending limit...
+
+RECOMMENDED NEXT
+  C006 GitHub Billing / spending limit...
+  Owner: human / action
+  State: ready
+
+PARALLEL READY
+  - C003 認証フローを実ブラウザで検証する -> browser
+
+WAITING
+  - C001 PR #42... — C006 is blocking CI...
+```
+
+## What the v1 workflow covers
 
 The v1 workflow is intentionally narrow:
 
@@ -38,693 +124,14 @@ The v1 workflow is intentionally narrow:
 
 Browser automation and direct agent dispatch remain advanced/experimental. They are not required for the v1 workflow.
 
-## Requirements
-
-- Windows 11 recommended
-- Node.js 20+
-- Git
-- GitHub CLI (`gh`) for GitHub observation
-- Vercel CLI only for projects using Vercel
-- Supabase CLI only for projects using Supabase
-
-## Install
-
-```powershell
-Set-Location C:\Dev\sumi-orchestrator
-npm link
-sumi init
-```
-
-SUMI stores project state outside the source repository:
-
-```text
-%USERPROFILE%\.sumi\state.json
-```
-
-State files are migrated under an exclusive lock. Before an older schema is replaced, SUMI preserves the previous valid file as `state.json.bak`. A state created by a newer unsupported SUMI version is rejected instead of being silently rolled back.
-
-The current state schema is **3**. Migrating a schema 2 state adds the top-level pattern ledger; per-project finding lists are filled in on load. No existing field is rewritten or removed.
-
-A state that has been raised to schema 3 can no longer be read by an older SUMI that does not know schema 3. That refusal is deliberate, and it is one-way: once any command has saved the state, the pre-migration file survives only as the single `state.json.bak`, which the next save overwrites. Take a named copy before upgrading if you may need to go back, and point verification runs at a throwaway file with `--data` while a schema change is still unmerged.
-
-Updating SUMI therefore does not erase registered project state.
-
-## Daily entry point
-
-Use `continue` when resuming a project:
-
-```powershell
-sumi continue musubu
-```
-
-Typical output:
-
-```text
-SUMI CONTINUE — MUSUBU
-========================================================================
-Progress: 33% (2/6 scope)
-Branch: fix/auth-confirm-sensitive-logging
-PR: 183
-CI: failed
-Worktree: clean
-
-BLOCKERS
-  ! C006 GitHub Billing / spending limit...
-
-RECOMMENDED NEXT
-  C006 GitHub Billing / spending limit...
-  Owner: human / action
-  State: ready
-
-PARALLEL READY
-  - C003 認証フローを実ブラウザで検証する -> browser
-
-WAITING
-  - C001 PR #183... — C006 is blocking CI...
-```
-
-The goal is to eliminate the recurring question: **"Where did this project stop?"**
-
-## Register a project
-
-```powershell
-sumi project add musubu `
-  --name "MUSUBU" `
-  --repo "example-org/musubu" `
-  --local "C:\Dev\musubu-example" `
-  --vercel "musubu-example" `
-  --supabase "abcdefghijklmnopqrst"
-```
-
-Omitting `--vercel` or `--supabase` means **not registered yet**, which SUMI reports as a setup gap. When a project genuinely does not use a service, record that explicitly with `none` so it stops being reported as missing:
-
-```powershell
-sumi project set ai-workforce --vercel none
-sumi project set ai-workforce --supabase none
-```
-
-SUMI treats the two cases differently:
-
-- **not registered** — SUMI cannot observe that service, so it does not invent work that depends on it
-- **`none` (not used)** — SUMI never calls that CLI for the project and never asks for the registration again
-
-A project with no completion Scope is reported as `UNSCOPED` rather than `IN DEVELOPMENT`, and `status` / `continue` / `queue` list the exact commands that close each gap under `SETUP REQUIRED`. Registration and Scope are never inferred automatically, and `DONE` still requires explicit Scope plus production evidence.
-
-List registered projects:
-
-```powershell
-sumi project list
-```
-
-Set portfolio priority with `P1` as highest and `P5` as lowest. Existing projects default to `P3`:
-
-```powershell
-sumi project set musubu --priority 1
-sumi project set hanami --priority 2
-```
-
-Priority is used by `project list`, `dashboard`, `queue`, and `batch`. Within the same priority, the first route item for each project is ranked before later items, which prevents one project from monopolizing the portfolio queue.
-
-## Observe current state
-
-```powershell
-sumi sync musubu
-sumi status musubu
-```
-
-`sync` is read-only toward GitHub, Vercel, and Supabase. It gathers evidence; it does not deploy or mutate infrastructure.
-
-`PROGRESS` is calculated **only** from explicit Scope criteria. Git history, PR count, or managed tasks are never silently treated as the whole-project denominator.
-
-## Define completion Scope
-
-```powershell
-sumi scope title musubu "MUSUBU current release gate"
-
-sumi scope add musubu `
-  "PR #183の変更内容を確認しマージ可能状態にする" `
-  --status doing
-
-sumi scope add musubu `
-  "認証フローを実ブラウザで検証する" `
-  --status todo
-
-sumi scope list musubu
-```
-
-Scope statuses:
-
-```text
-todo | doing | blocked | done | cancelled
-```
-
-SUMI can suggest missing completion criteria without applying them automatically:
-
-```powershell
-sumi scope suggest musubu
-```
-
-It can also review existing Scope statuses against current evidence:
-
-```powershell
-sumi scope review musubu
-```
-
-## Route the next work
-
-```powershell
-sumi route musubu
-```
-
-SUMI currently distinguishes work such as:
-
-- `claude-code / execute` — implementation, repository changes, CI diagnosis
-- `codex / review` — independent PR/code review
-- `browser / verify` — runtime/browser verification
-- `human / action` — billing, permissions, account-owner actions
-
-These agents are defined in one capability registry. Codex automatic dispatch remains restricted to read-only review mode. Claude Code is write-capable and still manual in direct dispatch; automatic execution is available only through an active SUMI session that owns an isolated worktree.
-
-Dependency-gated work is shown as `WAITING` rather than repeatedly re-dispatched.
-
-Generate an assignment prompt:
-
-```powershell
-sumi route musubu --prompt C001
-```
-
-## Ingest an AI/human result
-
-Interactive mode:
-
-```powershell
-sumi result musubu C001 --agent codex --apply
-```
-
-Paste the result and finish with:
-
-```text
-.end
-```
-
-Or use a file/text argument:
-
-```powershell
-sumi result musubu C001 --agent codex --file .\result.txt --apply
-```
-
-SUMI extracts evidence, blockers, and conservative Scope transitions. Explicit agent verdicts are preferred over weaker heuristics; for example, `mergeable` does not automatically close a gate if the reviewer explicitly says it must remain open.
-
-## Explain why a gate has its status
-
-```powershell
-sumi result list musubu
-sumi result show musubu R001
-sumi evidence musubu C002
-```
-
-The Evidence Ledger answers questions such as:
-
-> Why was C002 marked done?
-
-without requiring the original chat to still exist.
-
-## Generate a handoff
-
-```powershell
-sumi handoff musubu
-```
-
-The handoff contains:
-
-- current repository/branch/PR state
-- project progress basis
-- current and blocked Scope items
-- next actions
-- CI diagnostics
-- recent merged PRs
-- recent decisions/results
-- instructions for the next AI/session
-
-## Global work queue
-
-Use `queue` when several projects are active and you want one prioritized work list across all of them:
-
-```powershell
-sumi queue
-```
-
-Refresh every registered project before building the queue when you need current external evidence:
-
-```powershell
-sumi queue --sync
-```
-
-The queue separates:
-
-- `HUMAN BLOCKERS` — account, billing, permission, or other human-owned gates that block progress
-- `AGENT READY` — work that can be dispatched now to Claude Code, Codex, or browser verification
-- `WAITING` — dependency-gated work that should not be repeatedly re-dispatched
-
-Filter the queue when assigning one type of worker:
-
-```powershell
-sumi queue --agent claude-code --state ready
-sumi queue --agent browser --state ready --limit 5
-```
-
-Turn a global queue item directly into the same evidence-backed assignment prompt used by the per-project Router:
-
-```powershell
-sumi queue --prompt 1
-sumi queue --prompt musubu:C003
-```
-
-The numeric selector follows the currently displayed/filtered queue order. `project:scopeId` is stable across display changes.
-
-This turns the per-project Router into a portfolio-level work queue without changing project state.
-
-## Parallel execution plan
-
-Use `batch` when you want to split ready work across several AI sessions without assigning two tasks from the same project at the same time:
-
-```powershell
-sumi batch
-sumi batch --max-concurrency 4
-sumi batch --agent browser
-```
-
-The planner is intentionally conservative:
-
-- only `ready` routes are scheduled; waiting dependencies are not dispatched
-- human/platform actions are shown separately and do not consume AI slots
-- each batch contains at most one assignment from a project, preventing concurrent agents from racing on the same repository state
-- `--max-concurrency` controls the number of different projects that may run in parallel (default `3`, maximum `16`)
-
-Generate copy-ready evidence-backed prompts for every assignment in a batch:
-
-```powershell
-sumi batch --prompts 1
-```
-
-Reserve an entire batch as execution sessions in one operation:
-
-```powershell
-sumi batch --start-sessions 1
-sumi batch --start-sessions 1 --worktree-root "D:\SUMI-worktrees" --ttl-min 180
-```
-
-For code-agent assignments this creates one isolated worktree per project; browser assignments receive leases without a code worktree. If any session/worktree fails to start, SUMI rolls back every session already created by that batch attempt, including the SUMI-created branch/worktree, so the batch does not remain half-reserved.
-
-Emit the session-bound prompts immediately after successful reservation:
-
-```powershell
-sumi batch --start-sessions 1 --emit-prompts
-```
-
-SUMI still does not launch the external AI processes itself. The batch operation reserves isolated execution contexts and produces prompts; Claude Code/Codex/browser execution remains explicit.
-
-## Work claims and leases
-
-Before handing a ready scope gate to an AI session, reserve it so the global queue and batch planner do not assign the same work twice:
-
-```powershell
-sumi claim musubu C003 --agent browser --owner browser-1 --ttl-min 120
-sumi claims
-sumi release musubu C003
-```
-
-Claims are time-limited leases. Active claims appear in the global queue as `CLAIMED` and are excluded from `sumi batch`. Expired leases stop blocking scheduling automatically and can be replaced without `--force`. Use `--force` only when deliberately taking over an unexpired lease.
-
-```powershell
-sumi claims --all
-sumi claim musubu C003 --agent browser --owner browser-2 --force
-```
-
-Moving a scope criterion to `done` or `cancelled` clears its lease. Claims do not mark work complete and do not change the completion percentage.
-
-## Execution sessions and worktree isolation
-
-Use a session when you are actually handing a scope gate to a worker. A session owns the claim and gives code agents (`claude-code` and `codex`) a dedicated Git worktree by default. If `--agent` is omitted, SUMI uses the Router decision; an explicit agent that conflicts with the Router is rejected:
-
-```powershell
-sumi session start musubu C003 --owner claude-1
-sumi session prompt musubu S001
-sumi session list
-```
-
-For code agents, the default workspace is created outside the primary repository under:
-
-```text
-%USERPROFILE%\.sumi\worktrees\<project>\<session>
-```
-
-Override the root when needed:
-
-```powershell
-sumi session start musubu C003 --agent codex --worktree-root "D:\SUMI-worktrees"
-```
-
-Browser and human sessions use the shared/no-write workspace by default. You can explicitly disable or request worktree creation with `--no-worktree` or `--worktree`.
-
-The generated session prompt includes the exact workspace and branch and tells the worker not to modify the primary worktree:
-
-```powershell
-sumi session prompt musubu S001
-```
-
-Inspect what an AI has actually changed in that isolated workspace without modifying it:
-
-```powershell
-sumi session inspect musubu S001
-```
-
-The inspection reports the exact branch/HEAD, the base commit captured when the session started, commits ahead/behind that base, dirty files, and any unexpected branch switch. This gives the orchestrator concrete workspace evidence instead of relying only on chat status.
-
-Run the Session Review Gate before handing code to independent review or merge:
-
-```powershell
-sumi session review musubu S001
-sumi session review musubu S001 --run-checks
-```
-
-The gate returns one of `WORKING`, `CHECKS_REQUIRED`, `BLOCKED`, `REVIEW_READY`, or `UNSUPPORTED`. `REVIEW_READY` requires an isolated clean worktree on the expected branch, at least one commit beyond the captured base, no behind-base divergence, and successful discovered verification commands. `--run-checks` always runs `git diff --check` and also runs available project scripts such as `npm test` and `npm run check` (falling back to `lint`/`build` when needed). A ready review does **not** auto-close the Scope gate or merge anything.
-
-Once a session is `REVIEW_READY`, generate an independent read-only reviewer assignment. By default SUMI uses Codex to review Claude Code work and Claude Code to review Codex work; it refuses self-review:
-
-```powershell
-sumi session reviewer-prompt musubu S001
-```
-
-The reviewer prompt is bound to the exact reviewed HEAD and includes the committed files and passed checks. If the branch, HEAD, or worktree changes after the Review Gate, SUMI refuses to generate or ingest the review until `session review --run-checks` is rerun. Ingest the reviewer outcome with:
-
-```powershell
-sumi session reviewer-result musubu S001 --agent codex --file .\review.txt
-sumi session reviewer-result musubu S001 --agent codex --file .\review.txt --apply
-```
-
-Reviewer results are linked to the execution session and reviewed HEAD. `--apply` still uses SUMI's conservative Scope-transition rules; a `MERGEABLE` verdict alone does not silently mark the Scope gate done.
-
-Check whether the exact reviewed HEAD is ready for an explicit merge decision:
-
-```powershell
-sumi session merge-status musubu S001
-sumi merge-queue
-```
-
-`MERGE_READY` requires both a fresh `REVIEW_READY` gate and an independent `MERGEABLE` verdict for the same HEAD. Any later commit or dirty worktree makes the prior certification stale. SUMI does not merge, push, deploy, or close the Scope gate from this command; merge remains an explicit GitHub/human action.
-
-Before acting on `MERGE_READY`, run the Release Gate against the **session branch**, not whichever branch happens to be checked out in the primary repository:
-
-```powershell
-sumi session release-status musubu S001 --sync
-sumi release-queue --sync
-```
-
-The Release Gate stores session-specific GitHub evidence and requires all of the following before returning `RELEASE_READY`:
-
-- the local Session Merge Gate is still `MERGE_READY`
-- an open, non-draft PR exists for the exact session branch
-- the GitHub PR HEAD SHA exactly matches the locally reviewed HEAD
-- GitHub status checks are conclusively green
-- GitHub does not report `CHANGES_REQUESTED` or an outstanding required review
-- GitHub does not report conflicts, a blocked merge, or an out-of-date branch
-- the external GitHub evidence is fresh (15 minutes by default)
-
-Refresh older evidence explicitly instead of trusting stale CI/review state:
-
-```powershell
-sumi session release-status musubu S001 --sync --max-age-min 10
-sumi release-queue --sync --max-age-min 10
-```
-
-`RELEASE_READY` is still a **decision gate**, not an execution command. SUMI v1.14 does not merge, push, deploy, or mutate GitHub from the Release Gate. Running `session release-status` records a certification snapshot bound to the exact PR and reviewed HEAD so post-merge delivery can be checked against the same artifact.
-
-After the explicit GitHub merge, continue with the Delivery Gate:
-
-```powershell
-sumi session delivery-status musubu S001 --sync
-sumi delivery-queue --sync
-```
-
-For Vercel projects, SUMI looks for a Production deployment whose `githubCommitSha` matches the exact GitHub merge commit. A Vercel `READY` result is intentionally **not** treated as final verification. The Delivery Gate remains at `PRODUCTION_VERIFICATION_REQUIRED` until the exact deployment is explicitly checked:
-
-```powershell
-sumi session delivery-verify musubu S001 `
-  --url "https://example-production.vercel.app" `
-  --note "production smoke test passed"
-```
-
-`DELIVERED` therefore means all of the following refer to the same certified change:
-
-- the `RELEASE_READY` snapshot identified PR and reviewed HEAD
-- GitHub reports that PR as merged with the same head SHA
-- GitHub exposes the resulting merge commit
-- Production evidence points to that exact merge commit
-- the exact Production deployment is READY
-- an explicit production verification is stored against that merge commit/deployment
-
-Delivery evidence also expires by default after 15 minutes so an old deployment state is not reused indefinitely. SUMI observes and certifies this chain; it still does not perform the merge or deployment itself.
-
-Once a session is `DELIVERED`, finalize its lifecycle and write an immutable-by-convention release snapshot:
-
-```powershell
-sumi session delivery-finalize musubu S001
-```
-
-Finalization is deliberately separate from production verification. It:
-
-- records a project release entry with PR, certified HEAD, merge commit, reviewer, verification checks, Production URL, and verification timestamp
-- moves the associated Scope criterion to `done`
-- closes the execution session as `completed` and releases its claim
-- remains idempotent, so repeating the command does not create duplicate release records
-- retains the worktree by default
-
-If the session worktree is known to be disposable, request safe cleanup at the same time:
-
-```powershell
-sumi session delivery-finalize musubu S001 --cleanup
-```
-
-A clean SUMI-created worktree is removed. A dirty worktree is **retained**, while the release finalization still succeeds, so uncommitted local work is never destroyed as a side effect of lifecycle closure.
-
-Inspect release history across the portfolio or one project:
-
-```powershell
-sumi releases
-sumi releases musubu --limit 20
-```
-
-Release history remains available even after the execution session is closed and is intended as the compact audit trail for what actually reached Production.
-
-Return an AI result directly through the session so SUMI automatically uses the session's scope ID and agent identity:
-
-```powershell
-sumi session result musubu S001 --file .\result.txt
-sumi session result musubu S001 --file .\result.txt --apply
-```
-
-`--apply` keeps the same conservative high-confidence transition rules as `sumi result`. If the applied result closes the scope gate, the session closes automatically. Use `--finish` when the worker is done but the scope gate should remain open for another pass:
-
-```powershell
-sumi session result musubu S001 --file .\result.txt --finish
-```
-
-Keep the lease alive during long work:
-
-```powershell
-sumi session renew musubu S001 --ttl-min 120
-```
-
-Close the orchestration session when work ends:
-
-```powershell
-sumi session finish musubu S001
-# or, if the work is intentionally stopped
-sumi session abandon musubu S001
-```
-
-Finishing or abandoning releases only that session's own claim. The worktree is deliberately retained so uncommitted or unpushed work cannot be lost. Cleanup is a separate operation:
-
-```powershell
-sumi session cleanup musubu S001
-```
-
-Worktree creation also refuses a dirty primary repository, because an isolated worktree starts from a committed Git ref and would otherwise silently omit the primary worktree's uncommitted changes. The worktree root must be outside the primary repository. Cleanup refuses to remove an active or dirty worktree. It removes only a SUMI-created, ended, clean worktree and leaves the Git branch intact. If a lease expires, the old session is preserved as `expired`; a new session may then take over the scope gate while keeping the old workspace/history available for inspection.
-
-When a scope criterion moves to `done` or `cancelled`, any active execution session for that criterion is closed automatically.
-
-## Multi-project dashboard
-
-```powershell
-sumi dashboard
-```
-
-Refresh registered projects first, then display them:
-
-```powershell
-sumi dashboard --sync
-```
-
-Example goal:
-
-```text
-SUMI DEV OS
-────────────────────────────────────────
-MUSUBU          33%   BLOCKED   GitHub Billing
-SHARENAIL       78%   ACTIVE    ZERO chat
-HANAMI          61%   ACTIVE    matching flow
-AI WORKFORCE    72%   WAITING   Windows approval
-```
-
-Percentages appear only where an explicit completion Scope exists.
-
-The `STATE` column separates a project that is genuinely being worked on from one that has never declared its Definition of Done:
-
-```text
-SHARENAIL       100%  DONE      —
-client INTL      —   UNSCOPED  setup: scope, vercel
-SUMI TRADE        —   UNSCOPED  GitHub ActionsのCI失敗原因を確認して修正する
-```
-
-`UNSCOPED` means the completion Scope is empty, so no percentage can exist. Projects with configuration gaps are listed under `SETUP REQUIRED` in `sumi queue`, separately from dispatchable work, and they are never numbered, so `queue --prompt <number>` keeps pointing at the same item.
-
-## Cross-project bug hunt: patterns and findings
-
-A bug found in one project is usually a question worth asking of every project. `pattern` and `finding` keep that question and its answers as a ledger instead of leaving them in a chat log.
-
-A **pattern** is the reusable question. A **finding** is one project's answer to it. `sweep` runs the mechanical questions and files what it reproduces.
-
-```powershell
-sumi pattern add supabase-rls-off `
-  --title "A public table has RLS disabled" `
-  --question "Does every public table have row level security enabled?" `
-  --origin "musubu:F014" `
-  --severity high `
-  --requires supabase `
-  --check "node scripts/check-rls.mjs" --check-expect exit-zero --check-timeout-ms 30000
-
-sumi pattern list
-sumi pattern show supabase-rls-off
-```
-
-`--origin` records where the question came from and accepts only three forms, so every pattern stays traceable to something a reader can open: `<project>:<findingId>`, `record`, or `<path>#<anchor>`.
-
-A pattern with a `--check` is `mechanical`; without one it is a `judgment` question that a reader has to answer by looking at the code. `--requires` limits a pattern to projects that use a given service (`supabase`, `vercel`).
-
-Record what a given project turned out to be:
-
-```powershell
-sumi finding add client `
-  --pattern supabase-rls-off `
-  --title "public.orders has RLS off" `
-  --source-kind agent --agent claude-code `
-  --commit 0123456789abcdef0123456789abcdef01234567 `
-  --files "supabase/migrations/0007_orders.sql" `
-  --output "no ENABLE ROW LEVEL SECURITY for public.orders"
-
-sumi finding list client
-sumi finding show client F001
-```
-
-Every finding requires a commit: evidence that cannot be re-checked later is not evidence. Long output is truncated to 4096 characters and flagged with `truncated`, never silently dropped.
-
-See the whole portfolio at once:
-
-```powershell
-sumi findings
-sumi findings --pattern supabase-rls-off
-```
-
-```text
-SUMI FINDINGS — 2 pattern(s) x 3 project(s)
-============================================================================================
-PATTERN                  SEV     hanami              client             musubu
---------------------------------------------------------------------------------------------
-supabase-rls-off         high    n/a                 suspected (2)       unknown
-unsigned-webhook         high    unknown             unknown             confirmed
-
-unknown = not checked yet, or a required service is unregistered. n/a = a required service is recorded as unused.
-clean = a sweep ran the pattern's check against a named commit here and did not reproduce it.
-status (n) = n finding(s) recorded here; the status shown is the loudest one.
-```
-
-The table never leaves a cell blank. `unknown` means SUMI has no answer yet — including when a required service is merely **unregistered**, and including a sweep that could not run. `n/a` appears only when the project has explicitly recorded that service as `none`. An unregistered service is an open question, not an irrelevant one, and SUMI will not rewrite one as the other. `clean` is the one cell a sweep can write without a finding: a check that ran to completion against a named commit and did not reproduce the pattern. When several findings sit behind one cell, the loudest status is shown with the total count, so a `fixed` finding cannot hide a `suspected` one.
-
-### Running the mechanical questions: `sweep`
-
-```powershell
-sumi sweep                                  # every mechanical pattern, every project
-sumi sweep supabase-rls-off                 # one pattern
-sumi sweep supabase-rls-off --project musubu
-sumi sweep --dry-run                        # run the checks, write nothing
-```
-
-```text
-SUMI SWEEP — 1 pattern(s) x 2 project(s)
-========================================================================
-PATTERN                  PROJECT        OUTCOME      FINDING   DETAIL
-------------------------------------------------------------------------
-service-role-in-client   clean          clean        —         @ 2922475d3bc8
-service-role-in-client   leaky          reproduced   F001      confirmed @ 087231238d57
-
-reproduced 1 | clean 1 | error 0 | skipped 0
-```
-
-`expect` describes what the check does on a project that does **not** have the problem. `exit-zero` (the default) suits an assertion script that exits 0 when all is well; `exit-nonzero` suits a `grep`-style detector that exits 0 when it finds the thing; `no-output` suits a linter that prints only its violations. A run that misses its expectation is the run that reproduced the finding.
-
-Under `no-output`, output decides, because a linter usually exits non-zero when it has violations to report. Silence *and* a non-zero exit is the one case output cannot speak for, so it is treated as a check that died rather than a project that came back clean.
-
-`exit-nonzero` cannot make that distinction: it reads **every** non-zero exit as healthy, so a detector that uses a separate error code — `grep` exits 2 on a bad pattern or an unreadable file — will report that error as a clean project. Prefer `exit-zero` or `no-output` for a check that can fail in more than one way.
-
-A reproduction is filed as a `sweep`-sourced confirmation, which is the one route to R1(a). If an open finding for that pattern already exists it gains a confirmation.
-
-What happens to a closed finding depends on what the closure was a judgment *about*:
-
-- **`dismissed` / `not_applicable`** are judgments about the reproduction — usually that the check is wrong here. The code reproducing it again is exactly what the judgment anticipated, so the run is recorded as `suppressed` and the ledger is left alone. Without this, one imprecise check hands back a fresh `confirmed` finding on every single sweep, and dismissing it never sticks.
-- **`fixed`** is a judgment about the code. A reproduction contradicts it, so a new finding is filed and the regression is visible rather than silently folded into the old record.
-
-An open finding always takes precedence over a dismissed one for the same pattern.
-
-The sweep is fail-closed at every point where it could invent an answer:
-
-| Situation | Outcome | What is written |
-|---|---|---|
-| Required service unregistered | `skipped` | nothing — the check is not run at all |
-| Required service recorded as unused | `skipped` | nothing — the cell is already `n/a` |
-| No local path, not a Git worktree, or a **dirty worktree** | `error` | a sweep record only; the cell stays `unknown` |
-| Check timed out, could not start, or died on a signal | `error` | a sweep record only; the cell stays `unknown` |
-| Check ran, did not reproduce | `clean` | a sweep record; **no confirmation** |
-| Check reproduced, but a `dismissed` / `not_applicable` finding already answers the cell | `suppressed` | a sweep record only; the ledger is left alone |
-| Check ran and reproduced | `reproduced` | a finding or a new confirmation, plus the sweep record |
-
-A dirty worktree is refused because evidence is bound to a commit: a result produced from uncommitted edits is not reproducible from the commit that would be recorded beside it.
-
-**A clean run records no confirmation.** Confirmations are counted by `source.kind`, so filing one for a check that found nothing would hand R1 the second source kind it needs and confirm a finding the sweep had just contradicted.
-
-A pattern's `check` is operator-authored code that `sweep` executes with the operator's own privileges, in the project's worktree. `pattern add --check` is therefore a trusted operation; the argv is run directly, without a shell.
-
-### The rules
-
-A finding's status is not a free-text field. Each transition is refused unless the evidence exists:
-
-- **suspected → confirmed** requires either a mechanical check that the sweep itself reproduced, or confirmations from two different `source.kind`s. An agent reporting its own conclusion — however many times — stays `suspected`. `sweep` is the only thing that can produce the first kind; there is still no flag for typing a check result in by hand.
-- **not_applicable / dismissed** require a non-empty reason. An empty string is refused.
-- **not_applicable** is additionally refused while a required service is unregistered, because that state is unknown rather than irrelevant.
-- **promote** accepts only a `confirmed` finding. It creates one ordinary scope criterion and links it back through `finding.scopeId`; it opens no new execution path, so promoted work flows through the existing route/queue/session pipeline.
-- **fixed** is derived, never asserted: the promoted scope criterion must be `done` and a session on that criterion must carry a delivery merge commit. `fixedBy` is read out of that session's delivery evidence, not from a command-line flag.
-
-```powershell
-sumi finding set-status client F001 --status confirmed `
-  --source-kind human --commit 0123456789abcdef0123456789abcdef01234567
-sumi finding promote client F001
-```
-
-Passing a source and commit to `set-status` records one more confirmation before the rule is applied. There is deliberately no flag for recording a check result by hand — see below.
-
-### Not closed
-
-The independence of two confirmations is judged **only** by the difference in `source.kind`. One operator who reports the same finding twice under two different kinds will pass the rule. This is not closed.
+## Documentation
+
+- [Per-project workflow](docs/per-project-workflow.md) — register a project, observe, declare completion Scope, route, ingest results, explain a status, hand off
+- [Portfolio view](docs/portfolio.md) — the cross-project queue, parallel batches, work leases, and the multi-project dashboard
+- [Execution sessions](docs/execution-sessions.md) — worktree isolation, the Review / Merge / Release / Delivery gates, and release history
+- [Cross-project bug hunt](docs/patterns-and-findings.md) — patterns, findings, `sweep`, and the rules for `confirmed` and `fixed`
+- [Design notes](docs/DESIGN-v0.1.md) — the original design sketch
+- [Changelog](CHANGELOG.md) — release notes
 
 ## Safety principles
 
@@ -768,26 +175,8 @@ npm test
 npm run check
 ```
 
-Current v1 validation target:
+The validation target is the full test suite plus the syntax checks, both green.
 
-```text
-291 tests passing
-syntax checks passing
-```
+## License
 
-## Repository strategy
-
-Use a single working directory going forward:
-
-```text
-C:\Dev\sumi-orchestrator
-```
-
-Do not create a new local folder for every version. Once the GitHub repository exists, normal updates should be:
-
-```powershell
-git pull
-npm link
-```
-
-instead of downloading and expanding versioned ZIPs.
+[MIT](LICENSE)
