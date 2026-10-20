@@ -177,6 +177,16 @@ npm run check
 
 The validation target is the full test suite plus the syntax checks, both green.
 
+## Author
+
+**Shingo Kumon** (公門 慎吾)
+
+Builds web services and business tools with AI-assisted development, and runs several of them in production.
+
+- More projects: [GitHub profile](https://github.com/ponponpon888)
+- Web: [shingokumon.com](https://www.shingokumon.com) / X: [@shingo_kumon](https://x.com/shingo_kumon)
+- Work enquiries (contract, fully remote): [contact](https://www.shingokumon.com/contact)
+
 ## License
 
 [MIT](LICENSE)
