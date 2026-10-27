@@ -4,9 +4,10 @@ import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { getAgentAdapter, isAutomaticSessionAdapter } from "./adapters.js";
 import { touch } from "./domain.js";
 import { buildSpawnInvocation, chooseResolvedCommand } from "./sync.js";
-import { buildSessionPrompt, getSession, ingestSessionResult, inspectSessionWorkspace } from "./sessions.js";
+import { buildSessionPrompt, createSessionTestContext, ingestSessionResult, inspectSessionWorkspace, validateSessionLease } from "./sessions.js";
 
 const commandPathCache = new Map();
+const PRODUCTION_TIME_SOURCE = Object.freeze({ testOnly: false, read: () => new Date() });
 
 function canonicalPath(value) {
   try { return fs.realpathSync.native(path.resolve(value)); }
@@ -93,20 +94,13 @@ function runProcess({ resolved, args, cwd, timeoutMs = 30 * 60 * 1000 }) {
   });
 }
 
-function validateSession(project, sessionId, now) {
-  const record = getSession(project, sessionId);
-  if (record.status !== "active") throw new Error(`Session ${record.id} is ${record.status}; only active sessions can run agents.`);
+function validateSession(project, sessionId, now, sessionApi = { validateSessionLease }) {
+  const { session: record } = sessionApi.validateSessionLease(project, sessionId, { now });
   const adapter = getAgentAdapter(record.agent);
   if (!adapter || !isAutomaticSessionAdapter(adapter, "execute")) {
     throw new Error(`Session agent ${record.agent} has no automatic isolated execution adapter.`);
   }
   if (!adapter.requiresIsolation) throw new Error(`Adapter ${adapter.id} is not marked isolation-required.`);
-
-  const item = project.scope?.criteria?.find((entry) => entry.id === record.scopeId);
-  const expiresAt = Date.parse(item?.claim?.expiresAt || "");
-  if (item?.claim?.sessionId !== record.id || !Number.isFinite(expiresAt) || expiresAt <= now.getTime()) {
-    throw new Error(`Session ${record.id} does not own an active lease; renew or restart it before execution.`);
-  }
 
   const workspace = record.workspace || {};
   if (workspace.mode !== "worktree" || !workspace.created || workspace.removedAt) {
@@ -137,17 +131,35 @@ function recordExecution(project, record, entry) {
   return entry;
 }
 
-export async function runSessionAgent(project, sessionId, { apply = false, finish = false, runner = null, now = new Date() } = {}) {
-  const current = now instanceof Date ? now : new Date(now);
-  if (Number.isNaN(current.getTime())) throw new Error(`Invalid execution timestamp: ${now}`);
-  const { record, adapter, cwd } = validateSession(project, sessionId, current);
-  const prompt = buildSessionPrompt(project, record.id);
+async function runSessionAgentWithClock(project, sessionId, {
+  apply = false,
+  finish = false,
+  runner = null,
+  now = undefined,
+  clock = null
+} = {}, timeSource = PRODUCTION_TIME_SOURCE, sessionApi = { buildSessionPrompt, ingestSessionResult, validateSessionLease }) {
+  const injectedRunner = typeof runner === "function";
+  const trustedClock = timeSource.testOnly && typeof clock === "function"
+    ? clock
+    : timeSource.read;
+  const currentValue = timeSource.testOnly && now !== undefined
+    ? now
+    : timeSource.read();
+  const current = currentValue instanceof Date ? currentValue : new Date(currentValue);
+  if (Number.isNaN(current.getTime())) throw new Error(`Invalid execution timestamp: ${currentValue}`);
+  const { record, adapter, cwd } = validateSession(project, sessionId, current, sessionApi);
+  const executionIdentity = Object.freeze({
+    sessionId: record.id,
+    owner: record.owner,
+    agent: record.agent
+  });
+  const prompt = sessionApi.buildSessionPrompt(project, executionIdentity.sessionId, { now: current });
   const attempt = (record.executions?.length || 0) + 1;
   const startedAt = current.toISOString();
 
   let execution;
   try {
-    if (runner) execution = await runner({ project, session: record, adapter, cwd, prompt });
+    if (injectedRunner) execution = await runner({ project, session: record, adapter, cwd, prompt });
     else {
       const resolved = resolveCommand(adapter.command);
       if (!resolved) throw new Error("Claude Code CLI not found. Install/login to Claude Code before running this session.");
@@ -168,12 +180,38 @@ export async function runSessionAgent(project, sessionId, { apply = false, finis
     execution = { ok: false, status: null, stdout: "", stderr: "", error: error.message, timedOut: false };
   }
 
-  const completedAt = new Date().toISOString();
+  const completedAtValue = trustedClock();
+  const completedAtDate = completedAtValue instanceof Date ? completedAtValue : new Date(completedAtValue);
+  const completedAt = Number.isNaN(completedAtDate.getTime())
+    ? null
+    : completedAtDate.toISOString();
   const baseEntry = { attempt, adapter: adapter.id, capability: adapter.capability, cwd, startedAt, completedAt };
-  if (!execution?.ok) {
+  // A clock failure must not hide an agent failure: keep the agent's own exit
+  // status (null when it never produced one) and append its failure reason.
+  const agentFailed = !execution?.ok;
+  const agentFailureReason = execution?.error || String(execution?.stderr || "").trim() || "Agent execution failed.";
+  const clockFailureEntry = (reason) => ({
+    ...baseEntry, status: "failed",
+    exitStatus: agentFailed ? (execution?.status ?? null) : (execution.status ?? 0),
+    reason: agentFailed ? `${reason} Agent execution also failed: ${agentFailureReason}` : reason,
+    resultId: null
+  });
+  if (!completedAt) {
+    const entry = recordExecution(project, record, clockFailureEntry(
+      `Trusted execution clock returned an invalid completion timestamp: ${completedAtValue}.`
+    ));
+    return { session: record, adapter, prompt, execution: entry, result: null, analysis: null, applied: null };
+  }
+  if (completedAtDate.getTime() < current.getTime()) {
+    const entry = recordExecution(project, record, clockFailureEntry(
+      "Execution completed before it started; refusing a system clock rollback."
+    ));
+    return { session: record, adapter, prompt, execution: entry, result: null, analysis: null, applied: null };
+  }
+  if (agentFailed) {
     const entry = recordExecution(project, record, {
       ...baseEntry, status: "failed", exitStatus: execution?.status ?? null,
-      reason: execution?.error || String(execution?.stderr || "").trim() || "Agent execution failed.", resultId: null
+      reason: agentFailureReason, resultId: null
     });
     return { session: record, adapter, prompt, execution: entry, result: null, analysis: null, applied: null };
   }
@@ -187,12 +225,58 @@ export async function runSessionAgent(project, sessionId, { apply = false, finis
     return { session: record, adapter, prompt, execution: entry, result: null, analysis: null, applied: null };
   }
 
-  const outcome = ingestSessionResult(project, record.id, resultText, { apply, finish, now: current });
+  let outcome;
+  try {
+    outcome = sessionApi.ingestSessionResult(project, executionIdentity.sessionId, resultText, {
+      apply,
+      finish,
+      now: completedAtDate,
+      minimumNow: completedAtDate,
+      expectedSessionId: executionIdentity.sessionId,
+      expectedOwner: executionIdentity.owner,
+      expectedAgent: executionIdentity.agent
+    });
+  } catch (error) {
+    if (error?.code !== "SESSION_LEASE_INVALID") throw error;
+    const entry = recordExecution(project, record, {
+      ...baseEntry, status: "failed", exitStatus: execution.status ?? 0,
+      reason: error.message, resultId: null
+    });
+    return { session: record, adapter, prompt, execution: entry, result: null, analysis: null, applied: null };
+  }
   const entry = recordExecution(project, record, {
     ...baseEntry, status: "completed", exitStatus: execution.status ?? 0, reason: null, resultId: outcome.result.id
   });
   outcome.result.sessionExecutionAttempt = attempt;
   return { ...outcome, adapter, prompt, execution: entry };
+}
+
+export async function runSessionAgent(project, sessionId, options = {}) {
+  return runSessionAgentWithClock(project, sessionId, options, PRODUCTION_TIME_SOURCE, {
+    buildSessionPrompt,
+    ingestSessionResult,
+    validateSessionLease
+  });
+}
+
+// Test-only adapter. Production callers always use the real process clock;
+// deterministic clocks are available only through this explicit test context.
+export function createSessionExecutorTestContext(clock = () => new Date(), sessionContext = null) {
+  const timeSource = { testOnly: true, read: clock };
+  const sessions = sessionContext || createSessionTestContext(clock);
+  return Object.freeze({
+    runSessionAgent: (project, sessionId, options = {}) => runSessionAgentWithClock(
+      project,
+      sessionId,
+      options,
+      timeSource,
+      {
+        buildSessionPrompt: sessions.buildSessionPrompt,
+        ingestSessionResult: sessions.ingestSessionResult,
+        validateSessionLease: sessions.validateSessionLease
+      }
+    )
+  });
 }
 
 export function formatSessionAgentRun(project, outcome, { applied = false } = {}) {

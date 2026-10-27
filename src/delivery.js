@@ -1,5 +1,7 @@
 import { getServiceState, touch } from "./domain.js";
 import { getSession } from "./sessions.js";
+import { createGithubApi, getPull, getVercelStatuses, pullState } from "./github.js";
+import { classifyVercelStatus } from "./health.js";
 import { commandExists, mapVercelStatus, parseVercelList, runCommand } from "./sync.js";
 
 export const DELIVERY_STATUSES = {
@@ -61,6 +63,32 @@ function parseMergeCommit(value) {
   return value.oid || value.sha || null;
 }
 
+/**
+ * Without the Vercel CLI: the status Vercel's Git integration posted on the
+ * merge commit. On the production branch, "Deployment has completed" is the
+ * production deployment of that commit. A deploy skipped by Ignored Build
+ * Step did not ship this commit, so it is never READY.
+ */
+function productionFromGithubStatus(api, repo, sha, projectName) {
+  const read = getVercelStatuses(api, repo, sha);
+  if (!read.ok) return { status: "unknown", rawStatus: null, url: null, environment: "Production", source: "github-status", error: read.error };
+  const wanted = String(projectName || "").toLowerCase();
+  const named = read.data.filter((status) => {
+    const match = String(status.context).match(/^vercel\s*[–—-]\s*(.+)$/i);
+    return Boolean(match && match[1].trim().toLowerCase() === wanted);
+  });
+  const pick = named.length === 1 ? named[0] : read.data.length === 1 ? read.data[0] : null;
+  if (!pick) {
+    return {
+      status: "unknown", rawStatus: null, url: null, environment: "Production", source: "github-status",
+      error: read.data.length ? `several Vercel statuses on ${sha.slice(0, 12)} and none names ${projectName}` : `no Vercel status on ${sha.slice(0, 12)}`
+    };
+  }
+  const kind = classifyVercelStatus(pick);
+  const status = { deployed: "ready", pending: "pending", failed: "failed", canceled: "cancelled" }[kind] || "unknown";
+  return { status, rawStatus: pick.description || pick.state || null, url: pick.url || null, environment: "Production", source: "github-status", context: pick.context };
+}
+
 function productionFromVercel(text) {
   const rows = parseVercelList(text);
   const row = rows.find((item) => String(item.environment || "").toLowerCase() === "production") || rows.find((item) => item.url) || rows[0] || null;
@@ -73,7 +101,7 @@ function productionFromVercel(text) {
   };
 }
 
-export function syncDeliveryEvidence(project, sessionId, { now = new Date() } = {}) {
+export function syncDeliveryEvidence(project, sessionId, { now = new Date(), githubApi = null, vercelCliAvailable = null } = {}) {
   const record = getSession(project, sessionId);
   const certification = record.releaseCertification || null;
   const observedAt = asDate(now).toISOString();
@@ -96,39 +124,43 @@ export function syncDeliveryEvidence(project, sessionId, { now = new Date() } = 
     evidence.error = "Project repository is not configured.";
     record.deliveryEvidence = evidence; touch(project); return evidence;
   }
-  if (!commandExists("gh")) {
+  if (!githubApi && !commandExists("gh")) {
     evidence.error = "GitHub CLI (gh) is not installed or not resolvable.";
     record.deliveryEvidence = evidence; touch(project); return evidence;
   }
+  const api = githubApi || createGithubApi();
 
-  const prResult = runCommand("gh", [
-    "pr", "view", String(certification.prNumber), "--repo", evidence.repo,
-    "--json", "number,state,mergedAt,mergeCommit,headRefOid,url"
-  ], { cwd: record.workspace?.path || project.local || undefined, timeout: 30000 });
-  if (!prResult.ok) {
-    evidence.error = prResult.stderr || prResult.error || "GitHub merged PR lookup failed.";
-    record.deliveryEvidence = evidence; touch(project); return evidence;
-  }
-
+  // REST (`gh api`), not `gh pr view` (GraphQL).
+  let prResult;
   try {
-    const pr = JSON.parse(prResult.stdout || "{}");
-    evidence.source.github = true;
-    evidence.pr = {
-      number: Number(pr.number),
-      state: String(pr.state || "").toUpperCase() || null,
-      mergedAt: pr.mergedAt || null,
-      headSha: pr.headRefOid || null,
-      mergeCommit: parseMergeCommit(pr.mergeCommit),
-      url: pr.url || certification.prUrl || null
-    };
-  } catch {
-    evidence.error = "GitHub CLI returned unreadable merged PR JSON.";
+    prResult = getPull(api, evidence.repo, certification.prNumber);
+  } catch (error) {
+    prResult = { ok: false, error: error.message };
+  }
+  if (!prResult.ok) {
+    evidence.error = prResult.error || "GitHub merged PR lookup failed.";
     record.deliveryEvidence = evidence; touch(project); return evidence;
   }
+  const pr = prResult.data;
+  const state = pullState(pr);
+  evidence.source.github = true;
+  evidence.pr = {
+    number: Number(pr.number),
+    state,
+    mergedAt: pr.merged_at || null,
+    headSha: pr.head?.sha || null,
+    // merge_commit_sha names a test merge until the PR is merged.
+    mergeCommit: state === "MERGED" ? parseMergeCommit(pr.merge_commit_sha) : null,
+    url: pr.html_url || certification.prUrl || null
+  };
 
   const mergeCommit = evidence.pr.mergeCommit;
   const vercelService = getServiceState(project, "vercel");
-  if (vercelService.state === "registered" && mergeCommit && commandExists("vercel")) {
+  const cliAvailable = vercelCliAvailable ?? commandExists("vercel");
+  if (vercelService.state === "registered" && mergeCommit && !cliAvailable) {
+    evidence.production = productionFromGithubStatus(api, evidence.repo, mergeCommit, vercelService.name);
+    evidence.source.production = evidence.production.status !== "unknown" || Boolean(evidence.production.rawStatus);
+  } else if (vercelService.state === "registered" && mergeCommit && cliAvailable) {
     const prodResult = runCommand("vercel", [
       "list", vercelService.name, "--prod", "--meta", `githubCommitSha=${mergeCommit}`, "--no-color"
     ], { cwd: project.local || record.workspace?.path || undefined, timeout: 30000 });
@@ -195,7 +227,7 @@ export function getDeliveryReadiness(project, sessionId, { now = new Date(), max
   if (evidence.production.status === "failed") return { ...row, status: DELIVERY_STATUSES.PRODUCTION_FAILED, reason: "Production deployment for the merge commit failed." };
   if (evidence.production.status === "pending") return { ...row, status: DELIVERY_STATUSES.PRODUCTION_PENDING, reason: "Production deployment for the merge commit is still pending." };
   if (evidence.production.status === "cancelled") return { ...row, status: DELIVERY_STATUSES.PRODUCTION_CANCELLED, reason: "Production deployment for the merge commit was cancelled." };
-  if (evidence.production.status !== "ready") return { ...row, status: DELIVERY_STATUSES.PRODUCTION_UNKNOWN, reason: "Production deployment state for the merge commit is not conclusively READY." };
+  if (evidence.production.status !== "ready") return { ...row, status: DELIVERY_STATUSES.PRODUCTION_UNKNOWN, reason: `Production deployment state for the merge commit is not conclusively READY${evidence.production.rawStatus ? ` (${evidence.production.rawStatus})` : ""}.` };
 
   const verification = record.deliveryVerification;
   if (!verification || verification.mergeCommit !== evidence.pr.mergeCommit) {

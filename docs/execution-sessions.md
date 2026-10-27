@@ -32,6 +32,14 @@ The generated session prompt includes the exact workspace and branch and tells t
 sumi session prompt musubu S001
 ```
 
+Run Claude Code explicitly in that session's isolated worktree:
+
+```powershell
+sumi session run musubu S001
+```
+
+This requires an active lease, a live SUMI-created worktree outside the primary repository, and an installed/authenticated Claude Code CLI with the required non-interactive flags. A successful run records its result; `--apply` applies supported Scope transitions and `--finish` ends the session after a successful result. Failed execution is recorded without creating an agent result. Direct dispatch and Codex session execution remain manual; code still goes through the Review Gate and an independent review.
+
 Inspect what an AI has actually changed in that isolated workspace without modifying it:
 
 ```powershell
@@ -86,7 +94,7 @@ The Release Gate stores session-specific GitHub evidence and requires all of the
 - an open, non-draft PR exists for the exact session branch
 - the GitHub PR HEAD SHA exactly matches the locally reviewed HEAD
 - GitHub status checks are conclusively green
-- GitHub does not report `CHANGES_REQUESTED` or an outstanding required review
+- no reviewer's latest review is `CHANGES_REQUESTED`, and GitHub does not report a required review outstanding (as a blocked merge, below)
 - GitHub does not report conflicts, a blocked merge, or an out-of-date branch
 - the external GitHub evidence is fresh (15 minutes by default)
 
@@ -97,6 +105,15 @@ sumi session release-status musubu S001 --sync --max-age-min 10
 sumi release-queue --sync --max-age-min 10
 ```
 
+### Release Gate over REST
+
+Both gates read GitHub through REST (`gh api`), never `gh pr` (GraphQL):
+
+- the PR is looked up with `head=<owner>:<branch>`, so a fork's branch of the same name never stands in; then, for the selected PR only, its detail (`mergeable`, `mergeable_state`), every review page, and the check runs and status contexts on its head commit. If any of these cannot be read, the sync fails (`RELEASE_SYNC_FAILED`) — no decision from part of the evidence. If the PR's head moves while it is being read, the sync fails too.
+- GitHub's review decision is GraphQL-only. Over REST it is derived from each reviewer's latest decisive review: any `CHANGES_REQUESTED` wins, then `APPROVED` (comments are ignored, dismissals clear). A review still **required** by branch protection is reported by GitHub as `mergeable_state: blocked`, which is `GITHUB_BLOCKED` — still not ready.
+- `mergeable` true / false / null is `MERGEABLE` / `CONFLICTING` / `UNKNOWN`; `mergeable_state` is used as the merge state (`clean`, `dirty`, `behind`, `blocked`, `unstable`, `draft`, `unknown`). GitHub computes mergeability lazily, so the first read can be `UNKNOWN` (`MERGEABILITY_UNKNOWN`); sync again.
+- The Delivery Gate reads the certified PR (`state` + `merged_at` give `MERGED` / `CLOSED` / `OPEN`). Its merge commit is `merge_commit_sha` only once the PR is merged — before that, REST names a test merge, which is ignored.
+
 `RELEASE_READY` is still a **decision gate**, not an execution command. SUMI v1.14 does not merge, push, deploy, or mutate GitHub from the Release Gate. Running `session release-status` records a certification snapshot bound to the exact PR and reviewed HEAD so post-merge delivery can be checked against the same artifact.
 
 After the explicit GitHub merge, continue with the Delivery Gate:
@@ -106,7 +123,7 @@ sumi session delivery-status musubu S001 --sync
 sumi delivery-queue --sync
 ```
 
-For Vercel projects, SUMI looks for a Production deployment whose `githubCommitSha` matches the exact GitHub merge commit. A Vercel `READY` result is intentionally **not** treated as final verification. The Delivery Gate remains at `PRODUCTION_VERIFICATION_REQUIRED` until the exact deployment is explicitly checked:
+For Vercel projects, SUMI looks for a Production deployment whose `githubCommitSha` matches the exact GitHub merge commit. With the Vercel CLI installed it asks Vercel (`vercel list --prod --meta githubCommitSha=<merge commit>`); without it, it reads the status Vercel's Git integration posted on the merge commit (`Deployment has completed` is ready; `Canceled by Ignored Build Step` means the commit did not ship and is never ready; with several Vercel projects on one repository only the `Vercel – <registered project>` status counts). The status's link is Vercel's deployment page, not the production URL. A Vercel `READY` result is intentionally **not** treated as final verification. The Delivery Gate remains at `PRODUCTION_VERIFICATION_REQUIRED` until the exact deployment is explicitly checked:
 
 ```powershell
 sumi session delivery-verify musubu S001 `

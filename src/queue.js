@@ -1,6 +1,7 @@
 import { getProjectProgress, getSetupGaps } from "./domain.js";
 import { getRoutePlan } from "./router.js";
 import { effectiveScopeStatus } from "./next.js";
+import { getHealthAlerts } from "./health.js";
 
 function criterionFor(project, scopeId) {
   if (!scopeId) return null;
@@ -135,12 +136,18 @@ export function formatGlobalQueue(projects, rows = getGlobalQueue(projects), fil
   if (filters.agent) filterBits.push(`agent=${filters.agent}`);
   if (filters.state) filterBits.push(`state=${filters.state}`);
 
+  // Health alerts cover every project, scoped or not. Like setup gaps they
+  // are not queue rows: unnumbered, so `--prompt <n>` keeps its meaning.
+  const alerts = [...active]
+    .sort((a, b) => (a.priority ?? 3) - (b.priority ?? 3) || a.id.localeCompare(b.id))
+    .flatMap((project) => getHealthAlerts(project).map((alert) => `  ! P${project.priority ?? 3} ${project.name} [${project.id}] [${alert.severity}] ${alert.text}`));
   const lines = [
     "SUMI GLOBAL QUEUE",
     "=".repeat(72),
-    `Projects: ${projectCount} | Items: ${rows.length} | Human blockers: ${humanBlockers.length} | Agent ready: ${agentReady.length} | Claimed: ${claimed.length} | Waiting: ${waiting.length}${setupRows.length ? ` | Setup: ${setupRows.length}` : ""}${filterBits.length ? ` | Filter: ${filterBits.join(", ")}` : ""}`,
+    `Projects: ${projectCount} | Items: ${rows.length} | Human blockers: ${humanBlockers.length} | Agent ready: ${agentReady.length} | Claimed: ${claimed.length} | Waiting: ${waiting.length}${setupRows.length ? ` | Setup: ${setupRows.length}` : ""}${alerts.length ? ` | Health alerts: ${alerts.length}` : ""}${filterBits.length ? ` | Filter: ${filterBits.join(", ")}` : ""}`,
     ""
   ];
+  if (alerts.length) lines.push("HEALTH ALERTS (human; not work items)", ...alerts, "");
 
   if (!rows.length) {
     lines.push("No matching work items.");

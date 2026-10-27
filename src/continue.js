@@ -1,3 +1,4 @@
+import { getHealthAlerts } from "./health.js";
 import { getCompletion, getSetupGaps } from "./domain.js";
 import { effectiveScopeStatus } from "./next.js";
 import { getRoutePlan } from "./router.js";
@@ -50,6 +51,13 @@ export function formatContinue(project, summary = getContinueSummary(project)) {
     `Worktree: ${project.observations?.local?.dirty === false ? "clean" : project.observations?.local?.dirty === true ? "dirty" : "unknown"}`,
     ""
   ];
+
+  const alerts = getHealthAlerts(project);
+  if (alerts.length) {
+    lines.push("HEALTH ALERTS");
+    for (const alert of alerts) lines.push(`  ! [${alert.severity}] ${alert.text}`);
+    lines.push("");
+  }
 
   if (summary.blockers.length) {
     lines.push("BLOCKERS");

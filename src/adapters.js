@@ -17,7 +17,7 @@ const definitions = [
     automaticModes: [],
     sessionAutomaticModes: ["execute"],
     requiresIsolation: true,
-    manualReason: "Claude Code write-capable dispatch is intentionally not automated; use the generated prompt or a future explicitly approved isolated adapter."
+    manualReason: "Direct Claude Code dispatch is manual; automatic execution requires an active isolated SUMI session."
   },
   {
     id: "browser",

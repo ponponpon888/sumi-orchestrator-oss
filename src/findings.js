@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import { addScopeCriterion, getServiceState, touch } from "./domain.js";
+import { BUNDLED_REPRODUCED_EXIT_CODES, bundledScriptDigest, canonicalBundledArgv, isBundledArgv, validateBundledArgv } from "./bundled-checks.js";
 
 export const FINDING_STATUSES = new Set(["suspected", "confirmed", "not_applicable", "fixed", "dismissed"]);
 export const PATTERN_KINDS = new Set(["mechanical", "judgment"]);
@@ -7,6 +9,7 @@ export const SOURCE_KINDS = new Set(["sweep", "agent", "human"]);
 export const CHECK_EXPECTATIONS = new Set(["exit-zero", "exit-nonzero", "no-output"]);
 export const CHECK_CWDS = new Set(["repo"]);
 export const PATTERN_SERVICES = new Set(["vercel", "supabase"]);
+export const PATTERN_SOURCE_KINDS = new Set(["pitfall-record", "builtin"]);
 export const REASON_REQUIRED_STATUSES = new Set(["not_applicable", "dismissed"]);
 export const EVIDENCE_OUTPUT_LIMIT = 4096;
 
@@ -66,20 +69,58 @@ export function normalizeOrigin(value) {
 export function normalizeCheck(check) {
   if (check === undefined || check === null) return null;
   if (typeof check !== "object" || Array.isArray(check)) throw new Error("Pattern check must be an object or null.");
-  const argv = Array.isArray(check.argv) ? check.argv : null;
-  if (!argv || argv.length === 0) throw new Error("Pattern check requires a non-empty argv array.");
-  for (const arg of argv) {
+  const rawArgv = Array.isArray(check.argv) ? check.argv : null;
+  if (!rawArgv || rawArgv.length === 0) throw new Error("Pattern check requires a non-empty argv array.");
+  for (const arg of rawArgv) {
     if (typeof arg !== "string" || !arg.length) throw new Error("Pattern check argv must contain non-empty strings.");
   }
+  const argv = canonicalBundledArgv(rawArgv);
+  // Rewritten from an absolute path: the old form's own exit-code lists are
+  // replaced by the bundled contract below, not merged with it.
+  const rewritten = argv !== rawArgv;
+  validateBundledArgv(argv);
   const timeoutMs = Number(check.timeoutMs ?? 60000);
   if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 600000) {
     throw new Error("Pattern check timeoutMs must be an integer between 1 and 600000.");
+  }
+  const errorExitCodes = rewritten ? [] : (check.errorExitCodes ?? []);
+  if (!Array.isArray(errorExitCodes) || errorExitCodes.some((code) => !Number.isInteger(code) || code < 1 || code > 255)) {
+    throw new Error("Pattern check errorExitCodes must be an array of integers between 1 and 255.");
+  }
+  const expect = oneOf(check.expect, CHECK_EXPECTATIONS, "pattern check expectation", "exit-zero");
+  // An allow-list of verdicts: with it, 0 is clean, a listed code is a
+  // reproduction, and every other exit is an execution error. Without it a
+  // check that dies with an unforeseen code (a shim's 126, a Windows crash)
+  // would be read as having reproduced the finding.
+  let reproducedExitCodes = rewritten ? [] : (check.reproducedExitCodes ?? []);
+  if (!Array.isArray(reproducedExitCodes) || reproducedExitCodes.some((code) => !Number.isInteger(code) || code < 1 || code > 255)) {
+    throw new Error("Pattern check reproducedExitCodes must be an array of integers between 1 and 255.");
+  }
+  if (isBundledArgv(argv)) {
+    // A bundled script's exit codes are fixed by SUMI, not by whoever typed
+    // the pattern: without the allow-list its "could not check" (2) would be
+    // read as a reproduction.
+    if (expect !== "exit-zero") throw new Error("A bundled check requires expect exit-zero.");
+    if (errorExitCodes.length) throw new Error("A bundled check takes no errorExitCodes; every exit other than 0 and 3 is already an error.");
+    const fixed = [...BUNDLED_REPRODUCED_EXIT_CODES];
+    if (reproducedExitCodes.length && JSON.stringify([...new Set(reproducedExitCodes)].sort((a, b) => a - b)) !== JSON.stringify(fixed)) {
+      throw new Error(`A bundled check's reproducedExitCodes are fixed at ${fixed.join(", ")}.`);
+    }
+    reproducedExitCodes = fixed;
+  }
+  if (reproducedExitCodes.length && expect !== "exit-zero") {
+    throw new Error("Pattern check reproducedExitCodes requires expect exit-zero.");
+  }
+  if (reproducedExitCodes.some((code) => errorExitCodes.includes(code))) {
+    throw new Error("Pattern check exit codes cannot be both reproduced and execution errors.");
   }
   return {
     argv: [...argv],
     cwd: oneOf(check.cwd, CHECK_CWDS, "pattern check cwd", "repo"),
     timeoutMs,
-    expect: oneOf(check.expect, CHECK_EXPECTATIONS, "pattern check expectation", "exit-zero")
+    expect,
+    ...(errorExitCodes.length ? { errorExitCodes: [...new Set(errorExitCodes)].sort((a, b) => a - b) } : {}),
+    ...(reproducedExitCodes.length ? { reproducedExitCodes: [...new Set(reproducedExitCodes)].sort((a, b) => a - b) } : {})
   };
 }
 
@@ -94,6 +135,20 @@ export function normalizeAppliesTo(appliesTo) {
     }
   }
   return { requires };
+}
+
+// Bind a sweep to what it actually evaluated, without making display labels
+// part of the check's identity. Normalize defaults and unordered service lists.
+export function getPatternFingerprint(pattern) {
+  const requires = normalizeAppliesTo(pattern.appliesTo)?.requires || [];
+  const check = normalizeCheck(pattern.check);
+  return createHash("sha256").update(JSON.stringify({
+    version: 1,
+    check,
+    requires: [...new Set(requires)].sort(),
+    // Only bundled checks add this key, so every other fingerprint is unchanged.
+    ...(check && isBundledArgv(check.argv) ? { bundledScript: bundledScriptDigest(check.argv) } : {})
+  })).digest("hex");
 }
 
 export function normalizeSource(source) {
@@ -132,9 +187,12 @@ function normalizeCheckRun(run, pattern) {
   if (typeof run.satisfied !== "boolean") throw new Error("Confirmation check requires a boolean 'satisfied'.");
   const exitCode = run.exitCode === undefined || run.exitCode === null ? null : Number(run.exitCode);
   if (exitCode !== null && !Number.isInteger(exitCode)) throw new Error("Confirmation check exitCode must be an integer.");
+  const check = normalizeCheck(pattern.check);
   return {
-    argv: [...pattern.check.argv],
-    expect: pattern.check.expect,
+    argv: [...check.argv],
+    expect: check.expect,
+    ...(check.errorExitCodes?.length ? { errorExitCodes: [...check.errorExitCodes] } : {}),
+    ...(check.reproducedExitCodes?.length ? { reproducedExitCodes: [...check.reproducedExitCodes] } : {}),
     exitCode,
     satisfied: run.satisfied,
     ranAt: isoDate(run.ranAt, "confirmation check ranAt")
@@ -174,7 +232,30 @@ function nextFindingSeq(findings) {
   return findings.reduce((max, item) => Math.max(max, Number(item.seq) || 0), 0) + 1;
 }
 
-export function addPattern(state, { key, title, question, check = null, origin, severity = "medium", appliesTo = null } = {}) {
+/**
+ * Where an imported pattern came from. It lets a later import tell an
+ * unchanged pattern from an updated record, and a pattern edited by hand since
+ * from either. Patterns added with `pattern add` carry no source.
+ */
+export function normalizePatternSource(source) {
+  if (source === undefined || source === null) return null;
+  if (typeof source !== "object" || Array.isArray(source)) throw new Error("Pattern source must be an object or null.");
+  const normalized = {
+    kind: oneOf(source.kind, PATTERN_SOURCE_KINDS, "pattern source kind"),
+    id: text(source.id, "Pattern source id"),
+    digest: text(source.digest, "Pattern source digest")
+  };
+  if (source.file !== undefined && source.file !== null) normalized.file = text(source.file, "Pattern source file");
+  if (source.confidence !== undefined && source.confidence !== null) normalized.confidence = text(source.confidence, "Pattern source confidence");
+  return normalized;
+}
+
+function optionalText(value, label) {
+  if (value === undefined || value === null || value === "") return null;
+  return text(value, label);
+}
+
+export function addPattern(state, { key, title, question, summary = null, check = null, origin, severity = "medium", appliesTo = null, source = null } = {}) {
   const patterns = ensurePatternsShape(state);
   const slug = text(key, "Pattern key");
   if (!PATTERN_KEY.test(slug)) throw new Error(`Pattern key must be lowercase letters, digits and hyphens: ${slug}`);
@@ -186,11 +267,13 @@ export function addPattern(state, { key, title, question, check = null, origin, 
     key: slug,
     title: text(title, "Pattern title"),
     question: text(question, "Pattern question"),
+    ...(optionalText(summary, "Pattern summary") ? { summary: optionalText(summary, "Pattern summary") } : {}),
     kind: normalizedCheck ? "mechanical" : "judgment",
     check: normalizedCheck,
     origin: normalizeOrigin(origin),
     severity: oneOf(severity, SEVERITIES, "pattern severity", "medium"),
     appliesTo: normalizeAppliesTo(appliesTo),
+    ...(normalizePatternSource(source) ? { source: normalizePatternSource(source) } : {}),
     createdAt: now,
     updatedAt: now
   };
@@ -219,6 +302,16 @@ export function setPattern(state, keyOrId, patch = {}) {
   if (patch.key !== undefined && patch.key !== pattern.key) throw new Error("Pattern key is a stable slug and cannot be changed.");
   if (patch.title !== undefined) pattern.title = text(patch.title, "Pattern title");
   if (patch.question !== undefined) pattern.question = text(patch.question, "Pattern question");
+  if (patch.summary !== undefined) {
+    const summary = optionalText(patch.summary, "Pattern summary");
+    if (summary) pattern.summary = summary;
+    else delete pattern.summary;
+  }
+  if (patch.source !== undefined) {
+    const source = normalizePatternSource(patch.source);
+    if (source) pattern.source = source;
+    else delete pattern.source;
+  }
   if (patch.origin !== undefined) pattern.origin = normalizeOrigin(patch.origin);
   if (patch.severity !== undefined) pattern.severity = oneOf(patch.severity, SEVERITIES, "pattern severity", "medium");
   if (patch.appliesTo !== undefined) pattern.appliesTo = normalizeAppliesTo(patch.appliesTo);
@@ -478,11 +571,21 @@ export function buildFindingsMatrix(state, { patternKey = null } = {}) {
       // run is still "unknown" — only a completed clean run answers the cell.
       let status = "unknown";
       let reason = applicability.reason;
+      let recheckRequired = false;
       if (applicability.applicable === "no") status = "n/a";
-      else if (sweep?.outcome === "clean") {
-        status = "clean";
-        reason = `swept ${sweep.ranAt} @ ${String(sweep.commit).slice(0, 12)}`;
-      } else if (sweep?.outcome === "error") reason = `sweep error: ${sweep.reason}`;
+      else if (applicability.applicable === "yes") {
+        if (sweep && ["clean", "error"].includes(sweep.outcome) && sweep.patternFingerprint !== getPatternFingerprint(pattern)) {
+          recheckRequired = true;
+          reason = pattern.kind !== "mechanical"
+            ? "pattern is now a judgment question; review its evidence"
+            : sweep.patternFingerprint
+              ? "check definition changed; rerun this pattern"
+              : "check definition was not recorded; rerun this pattern";
+        } else if (sweep?.outcome === "clean") {
+          status = "clean";
+          reason = `swept ${sweep.ranAt} @ ${String(sweep.commit).slice(0, 12)}`;
+        } else if (sweep?.outcome === "error") reason = `sweep error: ${sweep.reason}`;
+      }
       return {
         projectId: project.id,
         status,
@@ -490,7 +593,8 @@ export function buildFindingsMatrix(state, { patternKey = null } = {}) {
         counts: {},
         cell: status,
         findings: [],
-        reason
+        reason,
+        recheckRequired
       };
     })
   }));
@@ -519,12 +623,19 @@ export function formatPattern(pattern) {
     `Severity: ${pattern.severity}`,
     `Origin: ${pattern.origin}`,
     `Applies to: ${pattern.appliesTo?.requires?.length ? `requires ${pattern.appliesTo.requires.join(", ")}` : "every project"}`,
+    `Imported from: ${pattern.source ? `${pattern.source.kind} ${pattern.source.id}${pattern.source.confidence ? ` (${pattern.source.confidence})` : ""}${pattern.source.file ? ` — ${pattern.source.file}` : ""}` : "—"}`,
     "",
     "QUESTION",
     `  ${pattern.question}`
   ];
+  if (pattern.summary) lines.push("", "SUMMARY", `  ${pattern.summary}`);
   if (pattern.check) {
     lines.push("", "CHECK", `  argv: ${pattern.check.argv.join(" ")}`, `  cwd: ${pattern.check.cwd} | timeout: ${pattern.check.timeoutMs}ms | expect: ${pattern.check.expect}`);
+    if (pattern.check.errorExitCodes?.length) lines.push(`  error exit codes: ${pattern.check.errorExitCodes.join(", ")}`);
+    if (pattern.check.reproducedExitCodes?.length) {
+      lines.push(`  reproduced exit codes: ${pattern.check.reproducedExitCodes.join(", ")} (0 is clean; any other exit is an execution error)`);
+    }
+    if (pattern.check.argv[0] === "{sumi-node}") lines.push("  bundled with SUMI; run by the Node binary running SUMI, resolved at sweep time");
   } else {
     lines.push("", "CHECK", "  none (judgment pattern; answer the question by reading the code)");
   }
@@ -579,9 +690,19 @@ export function formatFindingsMatrix(matrix) {
   for (const row of matrix.rows) {
     lines.push(`${pad(row.pattern.key, 24)} ${pad(row.pattern.severity, 7)} ${row.cells.map((cell) => pad(cell.cell, width)).join(" ")}`);
   }
+  const outdated = matrix.rows.flatMap((row) => row.cells.filter((cell) => cell.recheckRequired).map((cell) => ({ row, cell })));
+  if (outdated.length) {
+    lines.push("", "RECHECK REQUIRED");
+    for (const { row, cell } of outdated) {
+      lines.push(`  ${row.pattern.key} / ${cell.projectId}: ${cell.reason}`);
+      lines.push(row.pattern.kind === "mechanical"
+        ? `  sumi sweep ${row.pattern.key} --project ${cell.projectId}`
+        : `  sumi pattern show ${row.pattern.key}`);
+    }
+  }
   lines.push(
     "",
-    "unknown = not checked yet, or a required service is unregistered. n/a = a required service is recorded as unused.",
+    "unknown = not checked yet, the check definition needs rechecking, or a required service is unregistered. n/a = a required service is recorded as unused.",
     "clean = a sweep ran the pattern's check against a named commit here and did not reproduce it.",
     "status (n) = n finding(s) recorded here; the status shown is the loudest one."
   );

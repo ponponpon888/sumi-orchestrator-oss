@@ -9,7 +9,7 @@ import { reviewSession } from "../src/review.js";
 import { ingestReviewerResult } from "../src/reviewer.js";
 import { startSession } from "../src/sessions.js";
 import { getReleaseReadiness, recordReleaseGate } from "../src/release.js";
-import { DELIVERY_STATUSES, getDeliveryQueue, getDeliveryReadiness, verifyDelivery } from "../src/delivery.js";
+import { DELIVERY_STATUSES, getDeliveryQueue, getDeliveryReadiness, syncDeliveryEvidence, verifyDelivery } from "../src/delivery.js";
 
 const NOW = new Date("2026-09-11T12:00:00.000Z");
 function git(args, cwd = null) { return execFileSync("git", args, { cwd: cwd || undefined, encoding: "utf8" }).trim(); }
@@ -110,4 +110,75 @@ test("delivery gate names vercel=none as the reason production evidence must com
   const row = getDeliveryReadiness(p, started.session.id, { now: NOW });
   assert.equal(row.status, DELIVERY_STATUSES.PRODUCTION_EVIDENCE_REQUIRED);
   assert.match(row.reason, /vercel=none/);
+});
+
+// --- syncDeliveryEvidence over REST --------------------------------------
+
+function deliveryApi(head, { pull = {}, statuses = null, statusFails = false } = {}) {
+  const merge = "c".repeat(40);
+  const calls = [];
+  const api = (route) => {
+    calls.push(route);
+    if (route === "repos/example-org/app/pulls/17") {
+      return { ok: true, data: { number: 17, state: "closed", merged_at: NOW.toISOString(), merge_commit_sha: merge, head: { sha: head }, html_url: "https://example.test/pr/17", ...pull } };
+    }
+    if (route === `repos/example-org/app/commits/${merge}/status`) {
+      return statusFails ? { ok: false, error: "HTTP 502" } : { ok: true, data: { statuses: statuses ?? [] } };
+    }
+    return { ok: false, error: `unrouted: ${route}` };
+  };
+  api.calls = calls;
+  return { api, merge };
+}
+const vercelStatus = (description, state = "success", context = "Vercel") => ({ context, state, description, target_url: "https://vercel.com/team/app/dpl" });
+
+test("delivery evidence is read over REST; without the Vercel CLI the merge commit's Vercel status is the production evidence", () => {
+  const { p, started, head } = setup();
+  const { api, merge } = deliveryApi(head, { statuses: [vercelStatus("Deployment has completed")] });
+  const evidence = syncDeliveryEvidence(p, started.session.id, { now: NOW, githubApi: api, vercelCliAvailable: false });
+  assert.equal(evidence.ok, true, evidence.error);
+  assert.equal(evidence.pr.state, "MERGED");
+  assert.equal(evidence.pr.mergeCommit, merge);
+  assert.deepEqual([evidence.production.status, evidence.production.source], ["ready", "github-status"]);
+  assert.equal(getDeliveryReadiness(p, started.session.id, { now: NOW }).status, DELIVERY_STATUSES.VERIFICATION_REQUIRED);
+  assert.ok(!api.calls.some((route) => /graphql/i.test(route)));
+});
+
+test("a merge commit skipped, failed, pending or without a Vercel status is never READY", () => {
+  const status = (statuses, opts = {}) => {
+    const { p, started, head } = setup();
+    syncDeliveryEvidence(p, started.session.id, { now: NOW, githubApi: deliveryApi(head, { statuses, ...opts }).api, vercelCliAvailable: false });
+    return getDeliveryReadiness(p, started.session.id, { now: NOW });
+  };
+  const skipped = status([vercelStatus("Canceled by Ignored Build Step")]);
+  assert.equal(skipped.status, DELIVERY_STATUSES.PRODUCTION_UNKNOWN);
+  assert.match(skipped.reason, /Ignored Build Step/);
+  assert.equal(status([vercelStatus("Deployment has failed", "failure")]).status, DELIVERY_STATUSES.PRODUCTION_FAILED);
+  assert.equal(status([vercelStatus("Vercel is deploying your app", "pending")]).status, DELIVERY_STATUSES.PRODUCTION_PENDING);
+  assert.equal(status([vercelStatus("Canceled from the Vercel Dashboard", "failure")]).status, DELIVERY_STATUSES.PRODUCTION_CANCELLED);
+  assert.equal(status([]).status, DELIVERY_STATUSES.PRODUCTION_EVIDENCE_REQUIRED);
+  assert.equal(status(null, { statusFails: true }).status, DELIVERY_STATUSES.PRODUCTION_EVIDENCE_REQUIRED);
+});
+
+test("with several Vercel projects on the repository, only the registered project's status counts", () => {
+  const { p, started, head } = setup();
+  const statuses = [vercelStatus("Deployment has failed", "failure", "Vercel – admin"), vercelStatus("Deployment has completed", "success", "Vercel – app")];
+  const evidence = syncDeliveryEvidence(p, started.session.id, { now: NOW, githubApi: deliveryApi(head, { statuses }).api, vercelCliAvailable: false });
+  assert.equal(evidence.production.status, "ready");
+  assert.equal(evidence.production.context, "Vercel – app");
+
+  const { p: q, started: s2, head: h2 } = setup();
+  const ambiguous = syncDeliveryEvidence(q, s2.session.id, { now: NOW, githubApi: deliveryApi(h2, { statuses: [vercelStatus("Deployment has completed", "success", "Vercel – x"), vercelStatus("Deployment has completed", "success", "Vercel – y")] }).api, vercelCliAvailable: false });
+  assert.equal(ambiguous.production.status, "unknown");
+  assert.match(ambiguous.production.error, /none names app/);
+});
+
+test("an open or closed-unmerged PR has no merge commit (REST's test merge is ignored)", () => {
+  const { p, started, head } = setup();
+  const evidence = syncDeliveryEvidence(p, started.session.id, { now: NOW, githubApi: deliveryApi(head, { pull: { state: "open", merged_at: null } }).api, vercelCliAvailable: false });
+  assert.equal(evidence.pr.state, "OPEN");
+  assert.equal(evidence.pr.mergeCommit, null);
+  assert.equal(getDeliveryReadiness(p, started.session.id, { now: NOW }).status, DELIVERY_STATUSES.PR_NOT_MERGED);
+  const closed = syncDeliveryEvidence(p, started.session.id, { now: NOW, githubApi: deliveryApi(head, { pull: { merged_at: null } }).api, vercelCliAvailable: false });
+  assert.equal(closed.pr.state, "CLOSED");
 });

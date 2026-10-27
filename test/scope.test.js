@@ -64,6 +64,80 @@ test("scope suggest suppresses semantic duplicates already covered by scope", ()
   assert.match(text, /C004 \[done\] Vercel Previewキャンセル理由を確認する/);
 });
 
+test("scope suggest matches PR review criteria by PR number and status without mutating scope", () => {
+  const p = observedProject();
+  p.deployment.pr = 306;
+  const originalCriteria = structuredClone(p.scope.criteria);
+  const old = addScopeCriterion(p, "PR #128の変更内容を確認しマージ可能状態にする", "cancelled");
+
+  let before = structuredClone(p);
+  let result = getScopeSuggestions(p);
+  assert.deepEqual(p, before);
+  assert.equal(result.covered.some((item) => item.suggestion.key === "pr-review-merge"), false);
+  assert.equal(result.fresh.some((item) => item.key === "pr-review-merge"), true);
+
+  const withoutPrNumber = addScopeCriterion(p, "PRの変更内容を確認しマージ可能状態にする", "doing");
+  before = structuredClone(p);
+  result = getScopeSuggestions(p);
+  assert.deepEqual(p, before);
+  assert.equal(result.covered.some((item) => item.suggestion.key === "pr-review-merge"), false);
+  assert.equal(result.fresh.some((item) => item.key === "pr-review-merge"), true);
+
+  const cancelled = addScopeCriterion(p, "PR #306の変更内容を確認しマージ可能状態にする", "cancelled");
+  before = structuredClone(p);
+  result = getScopeSuggestions(p);
+  assert.deepEqual(p, before);
+  assert.equal(result.covered.some((item) => item.suggestion.key === "pr-review-merge"), false);
+  assert.equal(result.fresh.some((item) => item.key === "pr-review-merge"), false);
+  assert.deepEqual(result.reconsider, [{ suggestion: result.observed.find((item) => item.key === "pr-review-merge"), criterion: cancelled }]);
+  assert.match(formatScopeSuggestions(p, result), new RegExp(`${cancelled.id} \\[cancelled\\]`));
+
+  const active = addScopeCriterion(p, "PR #306の変更内容を確認しマージ可能状態にする", "blocked");
+  before = structuredClone(p);
+  result = getScopeSuggestions(p);
+  assert.deepEqual(p, before);
+  assert.equal(result.covered.find((item) => item.suggestion.key === "pr-review-merge").criterion.id, active.id);
+  assert.equal(result.reconsider.length, 0);
+
+  active.status = "done";
+  before = structuredClone(p);
+  result = getScopeSuggestions(p);
+  assert.deepEqual(p, before);
+  assert.equal(result.covered.find((item) => item.suggestion.key === "pr-review-merge").criterion.id, active.id);
+
+  assert.deepEqual(originalCriteria, []);
+  assert.equal(old.status, "cancelled");
+  assert.equal(withoutPrNumber.status, "doing");
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(active.status, "done");
+});
+
+test("scope suggest covers same-PR todo, doing, blocked, and done criteria", () => {
+  for (const status of ["todo", "doing", "blocked", "done"]) {
+    const p = observedProject();
+    p.deployment.pr = 306;
+    const criterion = addScopeCriterion(p, "PR #306の変更内容を確認しマージ可能状態にする", status);
+    const result = getScopeSuggestions(p);
+    const covered = result.covered.find((item) => item.suggestion.key === "pr-review-merge");
+    assert.equal(covered.criterion.id, criterion.id);
+    assert.equal(result.fresh.some((item) => item.key === "pr-review-merge"), false);
+  }
+});
+
+test("scope suggest prioritizes an active PR criterion over done or cancelled criteria regardless of order", () => {
+  for (const statuses of [["cancelled", "done", "todo"], ["todo", "done", "cancelled"]]) {
+    const p = observedProject();
+    p.deployment.pr = 306;
+    const criteria = statuses.map((status) =>
+      addScopeCriterion(p, "PR #306の変更内容を確認しマージ可能状態にする", status)
+    );
+    const result = getScopeSuggestions(p);
+    const covered = result.covered.find((item) => item.suggestion.key === "pr-review-merge");
+    assert.equal(covered.criterion.id, criteria.find((criterion) => criterion.status === "todo").id);
+    assert.equal(result.reconsider.length, 0);
+  }
+});
+
 test("scope suggest leaves only genuinely uncovered gates as fresh", () => {
   const p = observedProject();
   addScopeCriterion(p, "GitHub Actionsのbaseline CI障害を切り分ける", "doing");

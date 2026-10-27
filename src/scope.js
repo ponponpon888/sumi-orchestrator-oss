@@ -89,19 +89,39 @@ function criterionKey(item) {
   return classifyAction(item.text) || `text:${String(item.text || "").normalize("NFKC").toLowerCase().trim()}`;
 }
 
+function preferredPrCriterion(criteria) {
+  const priority = { todo: 0, doing: 1, blocked: 2, done: 3, cancelled: 4 };
+  return [...criteria].sort((a, b) =>
+    (priority[a.status] ?? 5) - (priority[b.status] ?? 5) || String(a.id).localeCompare(String(b.id))
+  )[0];
+}
+
 export function getScopeSuggestions(project) {
   const suggestions = observedScopeSuggestions(project);
   const existing = project.scope?.criteria || [];
   const covered = [];
   const fresh = [];
+  const reconsider = [];
 
   for (const item of suggestions) {
-    const match = existing.find((criterion) => criterionKey(criterion) === item.key);
-    if (match) covered.push({ suggestion: item, criterion: match });
-    else fresh.push(item);
+    const matches = existing.filter((criterion) => criterionKey(criterion) === item.key);
+    if (item.key !== "pr-review-merge") {
+      if (matches[0]) covered.push({ suggestion: item, criterion: matches[0] });
+      else fresh.push(item);
+      continue;
+    }
+
+    const prNumber = criterionPrNumber(item.text);
+    const prMatches = prNumber === null
+      ? []
+      : matches.filter((criterion) => criterionPrNumber(criterion.text) === prNumber);
+    const match = preferredPrCriterion(prMatches);
+    if (!match) fresh.push(item);
+    else if (match.status === "cancelled") reconsider.push({ suggestion: item, criterion: match });
+    else covered.push({ suggestion: item, criterion: match });
   }
 
-  return { observed: suggestions, covered, fresh };
+  return { observed: suggestions, covered, fresh, reconsider };
 }
 
 export function formatScopeSuggestions(project, result = getScopeSuggestions(project)) {
@@ -109,6 +129,7 @@ export function formatScopeSuggestions(project, result = getScopeSuggestions(pro
     `SCOPE SUGGESTIONS — ${project.name}`,
     `Observed gates: ${result.observed.length}`,
     `Covered by current scope: ${result.covered.length}`,
+    `Reconsider cancelled criteria: ${(result.reconsider || []).length}`,
     `New suggestions: ${result.fresh.length}`,
     ""
   ];
@@ -129,7 +150,18 @@ export function formatScopeSuggestions(project, result = getScopeSuggestions(pro
       lines.push(`    Reason: ${s.reason}`);
       if (s.evidence.length) lines.push(`    Evidence: ${s.evidence.join(" | ")}`);
     }
-  } else {
+  }
+
+  if (result.reconsider?.length) {
+    if (result.fresh.length) lines.push("");
+    lines.push("RECONSIDER CANCELLED");
+    for (const { suggestion: s, criterion: c } of result.reconsider) {
+      lines.push(`  ? ${c.id} [${c.status}] ${c.text}`);
+      lines.push(`    Current observation: ${s.reason}`);
+    }
+  }
+
+  if (!result.fresh.length && !result.reconsider?.length) {
     lines.push("No new completion criteria suggested from current observations.");
   }
 

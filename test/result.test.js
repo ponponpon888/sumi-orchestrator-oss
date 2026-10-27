@@ -128,6 +128,62 @@ test("a blocker-free explicit completion still moves the target gate to done", (
   assert.ok(result.statusChanges.some((x) => x.criterionId === "C005" && x.to === "done" && x.confidence === "high"));
 });
 
+test("another scope's blocked and open verdicts do not override the completed target", () => {
+  for (const text of [
+    "C001 can move to done. C002 stays blocked. C003 stays open.",
+    "C001 can move to done, but C002 stays blocked and C003 stays open.",
+    "C002 remains blocked. C001 can move to done.",
+    "C001 can move to done. blocked: C002.",
+    "C001 can move to done. C002 must not move to done.",
+    "C001 can move to done. C002: CHANGES_REQUIRED.",
+    "Verified the local checkout.\nC001 can move to done.\nWindows verification was not executed. C002 stays blocked. C003 stays open."
+  ]) {
+    const p = projectFixture();
+    p.scope.criteria[1].status = "blocked";
+    const result = analyzeAgentResult(p, "C001", text, { agent: "codex" });
+    assert.equal(result.targetDisposition?.action, "done", text);
+    applyAgentResult(p, result);
+    assert.equal(p.scope.criteria[0].status, "done");
+    assert.equal(p.scope.criteria[1].status, "blocked");
+    assert.equal(p.scope.criteria[2].status, "todo");
+  }
+});
+
+test("another scope's done verdict cannot close the target or override its open verdict", () => {
+  for (const text of ["C002 can move to done.", "C001 stays open, while C002 can move to done."]) {
+    const result = analyzeAgentResult(projectFixture(), "C001", text, { agent: "codex" });
+    assert.equal(result.statusChanges.some(x => x.criterionId === "C001" && x.to === "done"), false, text);
+  }
+});
+
+test("shared scope verdicts still apply to every explicitly grouped scope", () => {
+  for (const target of ["C001", "C002"]) {
+    const result = analyzeAgentResult(projectFixture(), target, "C001 and C002 remain blocked.", { agent: "codex" });
+    assert.equal(result.targetDisposition?.action, "blocked");
+    const done = analyzeAgentResult(projectFixture(), target, "C001, C002 can move to done.");
+    assert.equal(done.targetDisposition?.action, "done");
+  }
+});
+
+test("unscoped warnings and target negation still prevent completion", () => {
+  for (const text of [
+    "C001 can move to done. Still blocked.",
+    "C001 can move to done. CHANGES_REQUIRED.",
+    "Do not mark C001 as done.",
+    "C001 is done. C001 is not done."
+  ]) {
+    const result = analyzeAgentResult(projectFixture(), "C001", text);
+    assert.notEqual(result.targetDisposition?.action, "done", text);
+  }
+});
+
+test("longer scope identifiers do not supply verdicts to their prefix", () => {
+  for (const text of ["C0010 is done.", "C0010 remains blocked."]) {
+    const result = analyzeAgentResult(projectFixture(), "C001", text, { agent: "codex" });
+    assert.equal(result.targetDisposition, null);
+  }
+});
+
 test("CHANGES_REQUIRED and remain open continue to override done language", () => {
   const p = projectFixture();
   const result = analyzeAgentResult(p, "C001", "VERDICT: CHANGES_REQUIRED. C001 must remain open and must not move to done.", { agent: "codex" });

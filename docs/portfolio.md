@@ -78,7 +78,7 @@ Emit the session-bound prompts immediately after successful reservation:
 sumi batch --start-sessions 1 --emit-prompts
 ```
 
-SUMI still does not launch the external AI processes itself. The batch operation reserves isolated execution contexts and produces prompts; Claude Code/Codex/browser execution remains explicit.
+The batch operation reserves isolated execution contexts and produces prompts. It does not launch external AI processes; Claude Code execution can then be started explicitly with `sumi session run` in an active isolated session.
 
 ## Work claims and leases
 

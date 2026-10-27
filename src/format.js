@@ -1,5 +1,15 @@
 import { getCompletion, getProjectStateLabel, getServiceState, getSetupGaps, PROJECT_STATES } from "./domain.js";
 import { buildNextQueue } from "./next.js";
+import { formatCiHealth, formatDeployHealth, getHealthAlerts } from "./health.js";
+
+export function healthAlertLines(project, indent = "  ") {
+  return getHealthAlerts(project).map((alert) => `${indent}! [${alert.severity}] ${alert.text}`);
+}
+
+function healthSection(project) {
+  const lines = healthAlertLines(project);
+  return lines.length ? `\nHEALTH ALERTS\n${lines.join("\n")}\n` : "";
+}
 
 function ciDetail(project) {
   const failedJobs = project.observations?.github?.failedJobs || [];
@@ -17,6 +27,17 @@ function ciDetail(project) {
   return `\nCI DETAIL\n${rows.join("\n")}\n`;
 }
 
+
+export function sourceLabel(project) {
+  if (project.source !== "github") return "local clone";
+  const observed = project.observations?.source;
+  if (observed?.error) {
+    const last = observed.lastKnownCommit ? `; last seen ${observed.lastKnownCommit.slice(0, 12)}, not current` : "";
+    return `GitHub (mirror refresh failed: ${observed.error}${last})`;
+  }
+  if (observed?.commit) return `GitHub ${observed.branch} @ ${observed.commit.slice(0, 12)} (refreshed ${observed.refreshedAt})`;
+  return "GitHub (not refreshed yet; run sumi sync)";
+}
 
 function localChanges(project) {
   const changes = project.observations?.local?.changes || [];
@@ -97,7 +118,7 @@ export function formatProject(project) {
   const readiness = o?.readiness?.total ? `${o.readiness.ready}/${o.readiness.total} ready${o.readiness.failed ? ` / ${o.readiness.failed} failed` : ""}${o.readiness.pending ? ` / ${o.readiness.pending} pending` : ""}${o.readiness.cancelled ? ` / ${o.readiness.cancelled} cancelled` : ""}` : "—";
   const verification = o?.verification?.required ? `${o.verification.status} (${o.verification.label})` : "not detected";
 
-  return `\n${project.name} [${project.id}]\n${"─".repeat(Math.max(24, project.name.length + project.id.length + 3))}\nSTATE       ${doneLabel}\nPRIORITY    P${project.priority ?? 3}\nPROGRESS    ${p}\nSETUP       ${setupLabel}\nWORK READY  ${readiness}\nREPO        ${project.repo ?? "—"}\nLOCAL       ${project.local ?? "—"}\nBRANCH      ${project.deployment.branch ?? "—"}\nCOMMIT      ${project.deployment.commit ? project.deployment.commit.slice(0, 12) : "—"}\nPR          ${project.deployment.pr ?? "—"}\nCI          ${project.deployment.ci}\nVERIFY      ${verification}\nPREVIEW     ${vercelPreview}\nPRODUCTION  ${vercelProduction}\nVERCEL      ${vercelLink}\nSUPABASE    ${supabaseState}\nWORKTREE    ${localState}\nSYNCED      ${synced}\n\nCURRENT\n  ${current}\n\nBLOCKED\n  ${blocked}\n\nNEXT\n${nextText}\n${setupSection(project)}${localChanges(project)}${ciDetail(project)}${recentDone(project)}${openScope(project)}${latestAgentResult(project)}\nLATEST DECISION\n${latestDecision ? `  ${latestDecision.text}${latestDecision.reason ? `\n  Reason: ${latestDecision.reason}` : ""}` : "  なし"}\n`;
+  return `\n${project.name} [${project.id}]\n${"─".repeat(Math.max(24, project.name.length + project.id.length + 3))}\nSTATE       ${doneLabel}\nPRIORITY    P${project.priority ?? 3}\nPROGRESS    ${p}\nSETUP       ${setupLabel}\nWORK READY  ${readiness}\nREPO        ${project.repo ?? "—"}\nSOURCE      ${sourceLabel(project)}\nLOCAL       ${project.local ?? "—"}\nBRANCH      ${project.deployment.branch ?? "—"}\nCOMMIT      ${project.deployment.commit ? project.deployment.commit.slice(0, 12) : "—"}\nPR          ${project.deployment.pr ?? "—"}\nCI          ${project.deployment.ci}\nCI HEALTH   ${formatCiHealth(project.observations?.github?.ciHealth)}\nPROD DEPLOY ${formatDeployHealth(project.observations?.github?.deployHealth)}\nVERIFY      ${verification}\nPREVIEW     ${vercelPreview}\nPRODUCTION  ${vercelProduction}\nVERCEL      ${vercelLink}\nSUPABASE    ${supabaseState}\nWORKTREE    ${localState}\nSYNCED      ${synced}\n${healthSection(project)}\nCURRENT\n  ${current}\n\nBLOCKED\n  ${blocked}\n\nNEXT\n${nextText}\n${setupSection(project)}${localChanges(project)}${ciDetail(project)}${recentDone(project)}${openScope(project)}${latestAgentResult(project)}\nLATEST DECISION\n${latestDecision ? `  ${latestDecision.text}${latestDecision.reason ? `\n  Reason: ${latestDecision.reason}` : ""}` : "  なし"}\n`;
 }
 
 export function formatDashboard(projects) {
@@ -123,5 +144,9 @@ export function formatDashboard(projects) {
         ?? (gaps.length ? `setup: ${gaps.map((gap) => gap.key).join(", ")}` : "—");
       return `${p.id.padEnd(20)} P${p.priority ?? 3}   ${progress.padEnd(5)} ${state.padEnd(8)} ${next}`;
     });
-  return `SUMI DASHBOARD\n${"=".repeat(72)}\nPROJECT              PRI  PROG  STATE    NEXT\n${"-".repeat(72)}\n${rows.join("\n") || "No projects yet."}\n`;
+  const alerts = Object.values(projects)
+    .sort((a, b) => (a.priority ?? 3) - (b.priority ?? 3) || a.name.localeCompare(b.name))
+    .flatMap((p) => getHealthAlerts(p).map((alert) => `  ! ${p.id}: [${alert.severity}] ${alert.text}`));
+  const alertBlock = alerts.length ? `\nHEALTH ALERTS\n${alerts.join("\n")}\n` : "";
+  return `SUMI DASHBOARD\n${"=".repeat(72)}\nPROJECT              PRI  PROG  STATE    NEXT\n${"-".repeat(72)}\n${rows.join("\n") || "No projects yet."}\n${alertBlock}`;
 }

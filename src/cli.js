@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import {
@@ -17,7 +18,11 @@ import {
   setProjectPriority
 } from "./domain.js";
 import { acquireStateLock, appendAudit, defaultDataPath, loadState, saveState } from "./store.js";
+import { setProjectSource } from "./mirror.js";
+import { applyPatternImport, assertPatternImportPlan, builtinPatternCandidates, formatPatternImport, pitfallCandidatesFromPath, planPatternImport, summarizePatternImport } from "./pattern-import.js";
 import { formatDashboard, formatProject } from "./format.js";
+import { buildHealthReport, formatHealthReport, reportHasAlertsAtLeast } from "./health.js";
+import { exportFindingAsPitfall, serializePitfallRecord, writePitfallRecord } from "./pitfall-export.js";
 import { formatHandoff } from "./handoff.js";
 import { diagnoseProject, syncProject } from "./sync.js";
 import { applyScopeStatusSuggestions, formatScopeStatusSuggestions, formatScopeSuggestions, getScopeStatusSuggestions, getScopeSuggestions } from "./scope.js";
@@ -56,6 +61,7 @@ function usage() {
 Core:
   sumi continue <project> [--no-sync]
   sumi dashboard [--sync]
+  sumi health [--sync] [--json] [--fail-on high|medium]
   sumi queue [--sync] [--agent codex|claude-code|browser|human] [--state ready|claimed|waiting] [--limit n] [--prompt <number|project:scopeId>]
   sumi merge-queue [--all]
   sumi release-queue [--sync] [--all] [--max-age-min n]
@@ -94,8 +100,11 @@ Core:
 
 Project setup:
   sumi project list
-  sumi project add <id> --name <name> [--repo owner/repo] [--local path] [--vercel name|none] [--supabase id|none] [--priority 1-5]
-  sumi project set <id> [--name name] [--repo owner/repo] [--local path] [--vercel name|none] [--supabase id|none] [--priority 1-5]
+  sumi project add <id> --name <name> [--repo owner/repo] [--local path] [--source local|github] [--vercel name|none] [--supabase id|none] [--priority 1-5]
+  sumi project set <id> [--name name] [--repo owner/repo] [--local path] [--source local|github] [--vercel name|none] [--supabase id|none] [--priority 1-5]
+      --source github: SUMI keeps its own mirror of the repo's default branch next to the
+      state file and syncs/sweeps that, refreshed from GitHub each time. Use it when the
+      code lives on GitHub and a local clone is stale or absent.
     Pass "none" to record that a project deliberately does not use that service.
     Unregistered and "not used" are reported differently by status/queue, and a
     project with no completion Scope is shown as UNSCOPED instead of IN DEVELOPMENT.
@@ -111,11 +120,20 @@ Cross-project bug hunt:
   sumi pattern add <key> --title <title> --question <question> --origin <origin>
       [--severity high|medium|low] [--requires supabase,vercel]
       [--check "<argv>"] [--check-expect exit-zero|exit-nonzero|no-output] [--check-timeout-ms n]
+      [--check-error-exit-codes 2,3|none] [--check-reproduced-exit-codes 3|none]
       origin is "<project>:<findingId>", "record", or "<path>#<anchor>".
       A pattern with a --check is mechanical; without one it is a judgment question.
   sumi pattern show <key>
   sumi pattern set <key> [--title t] [--question q] [--origin o] [--severity s] [--requires list|none] [--check "<argv>"|none]
+      [--check-error-exit-codes 2,3|none] [--check-reproduced-exit-codes 3|none] (requires an existing or new check)
+      --check-reproduced-exit-codes makes exit 0 clean, the listed codes reproduced, and every other exit an error.
   sumi pattern remove <key>
+  sumi pattern import <file-or-dir> [--update] [--dry-run]
+  sumi pattern import --builtin [--update] [--dry-run]
+      Imports ai-workforce pitfall records (data/app-pitfalls/*.json) or SUMI's
+      built-in patterns. All-or-nothing: one invalid record or refused update
+      writes nothing. A changed record needs --update; a pattern edited by hand
+      since import is never overwritten.
   sumi finding add <project> --title <title> --source-kind sweep|agent|human --commit <sha>
       [--pattern <key>] [--detail text] [--severity high|medium|low]
       [--agent name] [--session id] [--files a,b] [--output text]
@@ -127,6 +145,7 @@ Cross-project bug hunt:
       confirmed needs a sweep-reproduced check or two different source kinds; fixed is
       derived from delivery evidence and cannot be asserted by hand.
   sumi finding promote <project> <findingId>
+  sumi finding export <project> <findingId> --id <record-id> [--out <dir|file.json>] [--title t] [--summary t] [--open-ok --why-not-closed t]
   sumi sweep [<pattern-key>] [--pattern <key>] [--project <id>] [--dry-run]
       Runs each mechanical pattern's check in every registered project's clean
       worktree and files what it reproduces as a sweep-sourced confirmation.
@@ -213,17 +232,42 @@ function persist(kind, details = {}) {
  * `--check "node scripts/check-rls.mjs"` is split on whitespace; a JSON array is
  * accepted for arguments that contain spaces. `none` clears an existing check.
  */
-function checkFromOptions() {
+function checkFromOptions(currentCheck = null) {
   const raw = option("check");
-  if (raw === undefined) return undefined;
-  if (raw === "none") return null;
-  const trimmed = String(raw).trim();
-  return {
-    argv: trimmed.startsWith("[") ? JSON.parse(trimmed) : trimmed.split(/\s+/).filter(Boolean),
-    cwd: option("check-cwd") ?? "repo",
-    timeoutMs: option("check-timeout-ms") === undefined ? 60000 : Number(option("check-timeout-ms")),
-    expect: option("check-expect") ?? "exit-zero"
-  };
+  const errorCodes = option("check-error-exit-codes");
+  const reproducedCodes = option("check-reproduced-exit-codes");
+  for (const [flag, value] of [["--check-error-exit-codes", errorCodes], ["--check-reproduced-exit-codes", reproducedCodes]]) {
+    if (argv.includes(flag) && (value === undefined || value.startsWith("--"))) {
+      throw new Error(`${flag} requires a comma-separated list or none.`);
+    }
+  }
+  if (raw === undefined && errorCodes === undefined && reproducedCodes === undefined) return undefined;
+  if (raw === "none") {
+    if (errorCodes !== undefined || reproducedCodes !== undefined) {
+      throw new Error("--check-error-exit-codes / --check-reproduced-exit-codes cannot be used with --check none.");
+    }
+    return null;
+  }
+  let check;
+  if (raw === undefined) {
+    if (!currentCheck) throw new Error("--check-error-exit-codes / --check-reproduced-exit-codes require an existing check or --check.");
+    check = { ...currentCheck };
+  } else {
+    const trimmed = String(raw).trim();
+    check = {
+      argv: trimmed.startsWith("[") ? JSON.parse(trimmed) : trimmed.split(/\s+/).filter(Boolean),
+      cwd: option("check-cwd") ?? "repo",
+      timeoutMs: option("check-timeout-ms") === undefined ? 60000 : Number(option("check-timeout-ms")),
+      expect: option("check-expect") ?? "exit-zero"
+    };
+  }
+  if (errorCodes !== undefined) {
+    check.errorExitCodes = errorCodes === "none" ? [] : errorCodes.split(",").map((code) => /^\d+$/.test(code.trim()) ? Number(code) : NaN);
+  }
+  if (reproducedCodes !== undefined) {
+    check.reproducedExitCodes = reproducedCodes === "none" ? [] : reproducedCodes.split(",").map((code) => /^\d+$/.test(code.trim()) ? Number(code) : NaN);
+  }
+  return check;
 }
 
 function appliesToFromOptions() {
@@ -290,6 +334,24 @@ try {
       persist("dashboard.sync", { projects: Object.keys(state.projects) });
     }
     console.log(formatDashboard(state.projects));
+  } else if (group === "health") {
+    const failOn = option("fail-on");
+    if (failOn !== undefined && !["high", "medium"].includes(failOn)) throw new Error(`--fail-on must be high or medium, not ${failOn}`);
+    const syncErrors = {};
+    if (argv.includes("--sync")) {
+      for (const [projectId, p] of Object.entries(state.projects)) {
+        try {
+          syncProject(p);
+        } catch (error) {
+          syncErrors[projectId] = error.message;
+          appendAudit({ kind: "health.sync.error", projectId, error: error.message }, dataPath);
+        }
+      }
+      persist("health.sync", { projects: Object.keys(state.projects) });
+    }
+    const report = buildHealthReport(state.projects, { syncErrors });
+    console.log(argv.includes("--json") ? JSON.stringify(report, null, 2) : formatHealthReport(report));
+    if (failOn && reportHasAlertsAtLeast(report, failOn)) process.exitCode = 3;
   } else if (group === "queue") {
     if (argv.includes("--sync")) {
       for (const [projectId, p] of Object.entries(state.projects)) {
@@ -576,7 +638,7 @@ try {
       for (const warning of observations.warnings) console.log(`- ${warning}`);
     }
   } else if (group === "handoff") {
-    console.log(formatHandoff(project(action)));
+    console.log(formatHandoff(project(action), { dataPath: path.resolve(dataPath) }));
   } else if (group === "route") {
     const p = project(action);
     const plan = getRoutePlan(p);
@@ -738,8 +800,10 @@ try {
       supabase: option("supabase") ?? null,
       priority: option("priority") ?? 3
     });
+    const source = option("source");
+    if (source !== undefined) setProjectSource(p, source, { dataPath });
     state.projects[id] = p;
-    persist("project.add", { projectId: id });
+    persist("project.add", { projectId: id, source: p.source ?? "local" });
     console.log(`Added project: ${id}`);
   } else if (group === "project" && action === "set") {
     const p = project(a);
@@ -747,6 +811,11 @@ try {
       const value = option(key);
       if (value !== undefined) p[key] = value;
     }
+    const source = option("source");
+    // Re-derive the mirror whenever the repo or source changes, so it always
+    // belongs to the repository the project now names.
+    if (source !== undefined) setProjectSource(p, source, { dataPath });
+    else if ((option("repo") !== undefined || option("local") !== undefined) && p.source === "github") setProjectSource(p, "github", { dataPath });
     const priority = option("priority");
     if (priority !== undefined) setProjectPriority(p, priority);
     else touch(p);
@@ -825,13 +894,36 @@ try {
       const value = option(key);
       if (value !== undefined) patch[key] = value;
     }
-    const check = checkFromOptions();
+    const check = checkFromOptions(getPattern(state, a).check);
     if (check !== undefined) patch.check = check;
     const appliesTo = appliesToFromOptions();
     if (appliesTo !== undefined) patch.appliesTo = appliesTo;
     const pattern = setPattern(state, a, patch);
     persist("pattern.set", { patternId: pattern.id, key: pattern.key, fields: Object.keys(patch) });
     console.log(`Updated ${pattern.id}: ${pattern.key}`);
+  } else if (group === "pattern" && action === "import") {
+    const builtin = argv.includes("--builtin");
+    const inputPath = positionalAfter("import");
+    if (builtin && inputPath) throw new Error("Pass either a file/directory or --builtin, not both.");
+    if (!builtin && !inputPath) throw new Error("pattern import needs a pitfall record file/directory or --builtin.");
+    const dryRun = argv.includes("--dry-run");
+    const source = builtin
+      ? { candidates: builtinPatternCandidates(), skipped: [], invalid: [], notes: [] }
+      : pitfallCandidatesFromPath(inputPath);
+    const plan = planPatternImport(state, source, { update: argv.includes("--update") });
+    assertPatternImportPlan(plan);
+    if (!dryRun) {
+      applyPatternImport(state, plan);
+      const totals = summarizePatternImport(plan);
+      if (totals.added || totals.updated || totals.rebaselined) {
+        persist("pattern.import", {
+          source: builtin ? "builtin" : inputPath,
+          ...totals,
+          keys: plan.rows.filter((row) => row.action !== "unchanged").map((row) => row.key)
+        });
+      }
+    }
+    console.log(formatPatternImport(plan, { label: builtin ? "built-in patterns" : inputPath, dryRun }));
   } else if (group === "pattern" && action === "remove") {
     const pattern = removePattern(state, a);
     persist("pattern.remove", { patternId: pattern.id, key: pattern.key });
@@ -859,6 +951,29 @@ try {
     const p = project(a);
     const finding = getFinding(p, b);
     console.log(formatFinding(p, finding, finding.patternKey ? findPattern(state, finding.patternKey) : null));
+  } else if (group === "finding" && action === "export") {
+    const p = project(a);
+    const exported = exportFindingAsPitfall(state, p, b, {
+      id: option("id"),
+      title: option("title") ?? null,
+      summary: option("summary") ?? null,
+      whyNotClosed: option("why-not-closed") ?? null,
+      openOk: argv.includes("--open-ok")
+    });
+    const out = option("out");
+    if (out) {
+      let written;
+      try {
+        written = writePitfallRecord(exported.record, path.resolve(out));
+      } catch (error) {
+        if (error.code === "EEXIST") throw new Error(`${error.path || out} already exists; SUMI does not overwrite a record.`);
+        throw error;
+      }
+      console.log(`Draft pitfall record written: ${written}`);
+    } else {
+      process.stdout.write(serializePitfallRecord(exported.record));
+    }
+    for (const note of exported.notes) console.error(`note: ${note}`);
   } else if (group === "finding" && action === "set-status") {
     const p = project(a);
     const source = sourceFromOptions();
