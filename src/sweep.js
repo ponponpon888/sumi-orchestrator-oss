@@ -7,11 +7,15 @@ import {
   getConfirmationBasis,
   getPattern,
   getPatternApplicability,
+  getPatternFingerprint,
   listFindings,
+  normalizeCheck,
   listPatterns,
   setFindingStatus
 } from "./findings.js";
-import { filterMeaningfulGitChanges, parseGitPorcelain, runCommand } from "./sync.js";
+import { filterMeaningfulGitChanges, GIT_LOCATION_VARS, parseGitPorcelain, runCommand } from "./sync.js";
+import { isBundledArgv, resolveBundledInvocation } from "./bundled-checks.js";
+import { isGithubSource, refreshMirror, restoreMirror } from "./mirror.js";
 
 export const SWEEP_OUTCOMES = new Set(["reproduced", "suppressed", "clean", "error", "skipped"]);
 
@@ -31,12 +35,42 @@ const SUPPRESSING_STATUSES = new Set(["dismissed", "not_applicable"]);
  * NOT have the pattern's problem. A run that misses its expectation is the run
  * that reproduced the finding, which is why `reproduced` is the negation of it.
  */
+function runCheckCommand(check, cwd) {
+  // A check runs in the swept worktree; an inherited GIT_DIR must not make
+  // a `git grep`-style check answer for the caller's repository instead.
+  if (!isBundledArgv(check.argv)) {
+    return runCommand(check.argv[0], check.argv.slice(1), { cwd, timeout: check.timeoutMs, dropEnv: GIT_LOCATION_VARS });
+  }
+  let invocation;
+  try {
+    invocation = resolveBundledInvocation(check.argv);
+  } catch (error) {
+    // A malformed placeholder in a hand-edited state file is this pattern's
+    // error, not a reason to stop every other pattern's sweep.
+    invocation = { error: error.message };
+  }
+  if (invocation.error) {
+    return { ok: false, status: null, signal: null, stdout: "", stderr: "", error: invocation.error, errorCode: "ENOENT", timedOut: false };
+  }
+  return runCommand(invocation.command, invocation.args, { cwd, timeout: check.timeoutMs, resolve: false, dropEnv: GIT_LOCATION_VARS });
+}
+
 export function evaluateCheckRun(check, result) {
   const exitCode = Number.isInteger(result?.status) ? result.status : null;
   if (result?.timedOut) return { ran: false, exitCode, reason: `check timed out after ${check.timeoutMs}ms` };
   if (result?.error) return { ran: false, exitCode, reason: result.error };
   if (exitCode === null) {
     return { ran: false, exitCode: null, reason: `check did not exit${result?.signal ? ` (signal ${result.signal})` : ""}` };
+  }
+  if (check.errorExitCodes?.includes(exitCode)) {
+    return { ran: false, exitCode, reason: `check exited ${exitCode}; configured as an execution error` };
+  }
+  if (check.reproducedExitCodes?.length && exitCode !== 0 && !check.reproducedExitCodes.includes(exitCode)) {
+    return {
+      ran: false,
+      exitCode,
+      reason: `check exited ${exitCode}; only 0 (clean) and ${check.reproducedExitCodes.join(", ")} (reproduced) are verdicts`
+    };
   }
   const output = [String(result.stdout ?? ""), String(result.stderr ?? "")]
     .map((part) => part.trim())
@@ -62,14 +96,28 @@ export function evaluateCheckRun(check, result) {
  * recorded commit does not reproduce, so it is refused rather than recorded
  * under a commit that does not describe it.
  */
-export function resolveSweepWorktree(project) {
+export function resolveSweepWorktree(project, { mirrorRefresher = refreshMirror } = {}) {
+  // A GitHub-source project is swept at the remote head, through SUMI's
+  // mirror. A refresh that fails is an error for this project: sweeping the
+  // mirror's previous state would answer for code that is no longer current.
+  if (isGithubSource(project)) {
+    const mirror = mirrorRefresher(project);
+    if (!mirror.ok) return { ok: false, reason: `GitHub mirror refresh failed: ${mirror.reason}` };
+    return resolveGitWorktree(mirror.path);
+  }
   if (!project.local) return { ok: false, reason: "no local path is configured" };
-  if (!fs.existsSync(project.local)) return { ok: false, reason: `local path not found: ${project.local}` };
-  const inside = runCommand("git", ["-C", project.local, "rev-parse", "--is-inside-work-tree"]);
-  if (!inside.ok || inside.stdout !== "true") return { ok: false, reason: `local path is not a Git worktree: ${project.local}` };
-  const head = runCommand("git", ["-C", project.local, "rev-parse", "HEAD"]);
+  return resolveGitWorktree(project.local);
+}
+
+function resolveGitWorktree(dir) {
+  if (!fs.existsSync(dir)) return { ok: false, reason: `local path not found: ${dir}` };
+  // An inherited GIT_DIR would make these answer for another repository.
+  const isolated = { dropEnv: GIT_LOCATION_VARS };
+  const inside = runCommand("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], isolated);
+  if (!inside.ok || inside.stdout !== "true") return { ok: false, reason: `local path is not a Git worktree: ${dir}` };
+  const head = runCommand("git", ["-C", dir, "rev-parse", "HEAD"], isolated);
   if (!head.ok || !head.stdout) return { ok: false, reason: "cannot read HEAD commit" };
-  const porcelain = runCommand("git", ["-C", project.local, "status", "--porcelain"]);
+  const porcelain = runCommand("git", ["-C", dir, "status", "--porcelain"], isolated);
   if (!porcelain.ok) return { ok: false, reason: "cannot read worktree status" };
   const changes = filterMeaningfulGitChanges(parseGitPorcelain(porcelain.stdout));
   if (changes.length) {
@@ -78,7 +126,7 @@ export function resolveSweepWorktree(project) {
       reason: `worktree has ${changes.length} uncommitted change(s); a result cannot be bound to ${head.stdout.slice(0, 12)}`
     };
   }
-  return { ok: true, cwd: project.local, commit: head.stdout };
+  return { ok: true, cwd: dir, commit: head.stdout };
 }
 
 function recordSweep(project, row, dryRun) {
@@ -86,6 +134,7 @@ function recordSweep(project, row, dryRun) {
   const sweeps = ensureSweepsShape(project);
   const entry = {
     patternKey: row.patternKey,
+    patternFingerprint: row.patternFingerprint,
     outcome: row.outcome,
     commit: row.commit ?? null,
     exitCode: row.exitCode ?? null,
@@ -104,8 +153,27 @@ function recordSweep(project, row, dryRun) {
 }
 
 function sweepProject(state, pattern, project, { runner, worktreeResolver, dryRun, ranAt }) {
+  let patternFingerprint;
+  let check;
+  try {
+    // The check is evaluated in its normalized form, the same form the
+    // fingerprint is computed from: a pattern stored before a rule existed
+    // (e.g. the fixed exit contract of a bundled check) gets that rule.
+    check = normalizeCheck(pattern.check);
+    patternFingerprint = getPatternFingerprint(pattern);
+  } catch (error) {
+    // A check definition that no longer validates (a hand-edited state file)
+    // is this pattern's error. Nothing is recorded: a sweep record must name
+    // the check it evaluated, and this one cannot be named.
+    return {
+      patternKey: pattern.key, patternFingerprint: null, projectId: project.id, ranAt, commit: null, exitCode: null,
+      reproduced: false, findingId: null, status: null, recorded: false, outcome: "error",
+      reason: `invalid check definition: ${error.message}`
+    };
+  }
   const base = {
     patternKey: pattern.key,
+    patternFingerprint,
     projectId: project.id,
     ranAt,
     commit: null,
@@ -130,12 +198,9 @@ function sweepProject(state, pattern, project, { runner, worktreeResolver, dryRu
 
   const result = runner
     ? runner({ project, pattern, cwd: worktree.cwd, commit: worktree.commit })
-    : runCommand(pattern.check.argv[0], pattern.check.argv.slice(1), {
-      cwd: worktree.cwd,
-      timeout: pattern.check.timeoutMs
-    });
+    : runCheckCommand(check, worktree.cwd);
 
-  const verdict = evaluateCheckRun(pattern.check, result);
+  const verdict = evaluateCheckRun(check, result);
   const row = { ...base, commit: worktree.commit, exitCode: verdict.exitCode ?? null };
   if (!verdict.ran) return recordSweep(project, { ...row, outcome: "error", reason: verdict.reason }, dryRun);
 
@@ -151,10 +216,10 @@ function sweepProject(state, pattern, project, { runner, worktreeResolver, dryRu
   const evidence = {
     commit: worktree.commit,
     files: [],
-    output: verdict.output || `check exited ${verdict.exitCode}; expected ${pattern.check.expect}`,
+    output: verdict.output || `check exited ${verdict.exitCode}; expected ${check.expect}`,
     checkedAt: ranAt
   };
-  const check = { satisfied: true, exitCode: verdict.exitCode, ranAt };
+  const checkRun = { satisfied: true, exitCode: verdict.exitCode, ranAt };
 
   const filed = listFindings(project, { patternKey: pattern.key });
   const open = filed.find((item) => OPEN_STATUSES.has(item.status));
@@ -172,7 +237,7 @@ function sweepProject(state, pattern, project, { runner, worktreeResolver, dryRu
 
   let finding;
   if (open) {
-    addConfirmation(state, project, open.id, { source, evidence, check });
+    addConfirmation(state, project, open.id, { source, evidence, check: checkRun });
     finding = open;
   } else {
     finding = addFinding(state, project, {
@@ -182,7 +247,7 @@ function sweepProject(state, pattern, project, { runner, worktreeResolver, dryRu
       severity: pattern.severity,
       source,
       evidence,
-      check
+      check: checkRun
     });
   }
 
@@ -210,6 +275,8 @@ export function runSweep(state, {
   projectIds = null,
   runner = null,
   worktreeResolver = null,
+  mirrorRefresher = refreshMirror,
+  mirrorRestorer = null,
   dryRun = false,
   now = new Date()
 } = {}) {
@@ -232,10 +299,35 @@ export function runSweep(state, {
   }
 
   const projects = selectSweepProjects(state, projectIds);
+  // A GitHub-source project is fetched once per run, and every pattern in
+  // the run is evaluated against that one commit. Fetching once is the only
+  // thing cached: before each pattern the worktree is checked again (a check
+  // may rewrite tracked files), and a mirror is first put back at the fetched
+  // commit, offline. A local worktree is never reset, so a check that
+  // dirtied it makes the next pattern an error, exactly as without a cache.
+  const fetched = new Map();
+  const resolveForPattern = (project) => {
+    if (worktreeResolver) return worktreeResolver(project);
+    if (!isGithubSource(project)) return resolveSweepWorktree(project);
+    if (!fetched.has(project.id)) {
+      const first = resolveSweepWorktree(project, { mirrorRefresher });
+      fetched.set(project.id, first);
+      return first;
+    }
+    const first = fetched.get(project.id);
+    if (!first.ok) return first;
+    const restored = (mirrorRestorer || restoreMirror)(project, first.commit);
+    if (!restored.ok) return { ok: false, reason: `cannot restore the mirror to ${first.commit.slice(0, 12)}: ${restored.reason}` };
+    const again = resolveGitWorktree(first.cwd);
+    if (again.ok && again.commit !== first.commit) {
+      return { ok: false, reason: `mirror moved from ${first.commit.slice(0, 12)} to ${again.commit.slice(0, 12)} during the sweep` };
+    }
+    return again;
+  };
   const rows = [];
   for (const pattern of patterns) {
     for (const project of projects) {
-      rows.push(sweepProject(state, pattern, project, { runner, worktreeResolver, dryRun, ranAt }));
+      rows.push(sweepProject(state, pattern, project, { runner, worktreeResolver: resolveForPattern, dryRun, ranAt }));
     }
   }
   return { patterns, projects, rows, dryRun, ranAt };

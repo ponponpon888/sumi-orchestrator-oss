@@ -700,8 +700,8 @@ test("handoff current and blocked include scope workflow state", async () => {
   addScopeCriterion(p, "Browser verification", "doing");
   addScopeCriterion(p, "Production smoke test", "blocked");
   const handoff = formatHandoff(p);
-  assert.match(handoff, /## Current[\s\S]*C002 Browser verification/);
-  assert.match(handoff, /## Blocked[\s\S]*C003 Production smoke test/);
+  assert.match(handoff.split("## Current\n")[1].split("\n## ")[0], /C002 Browser verification/);
+  assert.match(handoff.split("## Blocked\n")[1].split("\n## ")[0], /C003 Production smoke test/);
 });
 
 test("vercel=none never reaches the Vercel CLI", () => {

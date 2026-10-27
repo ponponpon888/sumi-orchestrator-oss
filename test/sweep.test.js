@@ -5,8 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createEmptyState, createProject, SERVICE_UNUSED } from "../src/domain.js";
+import { loadState, saveState } from "../src/store.js";
 import {
-  addFinding, addPattern, buildFindingsMatrix, findSweep, getFinding, listFindings, setFindingStatus
+  addFinding, addPattern, buildFindingsMatrix, findSweep, formatFindingsMatrix, getFinding, listFindings, setFindingStatus, setPattern
 } from "../src/findings.js";
 import { evaluateCheckRun, formatSweepRun, resolveSweepWorktree, runSweep, summarizeSweep } from "../src/sweep.js";
 
@@ -72,6 +73,39 @@ test("a check that never ran is an error, never a verdict", () => {
   const signalled = evaluateCheckRun(check, ok({ status: null, signal: "SIGKILL" }));
   assert.equal(signalled.ran, false);
   assert.match(signalled.reason, /SIGKILL/);
+});
+
+test("configured error exit codes never create findings or confirmations in any expectation mode", () => {
+  for (const expect of ["exit-zero", "exit-nonzero", "no-output"]) {
+    const { state, project } = setup();
+    const pattern = mechanicalPattern(state, {
+      check: { argv: ["node", "check.mjs"], expect, errorExitCodes: [2] }
+    });
+    const outcome = stubbedSweep(state, ok({ status: 2, stderr: "cannot read target file" }));
+    assert.equal(outcome.rows[0].outcome, "error", expect);
+    assert.equal(outcome.rows[0].exitCode, 2);
+    assert.match(outcome.rows[0].reason, /configured as an execution error/);
+    assert.equal(listFindings(project, {}).length, 0);
+    assert.equal(buildFindingsMatrix(state).rows[0].cells[0].cell, "unknown");
+
+    const finding = addFinding(state, project, {
+      title: pattern.title, patternKey: pattern.key, source: { kind: "agent" },
+      evidence: { commit: COMMIT, output: "suspected issue" }
+    });
+    const before = finding.confirmations.length;
+    stubbedSweep(state, ok({ status: 2, stdout: "failed to inspect target" }));
+    assert.equal(finding.status, "suspected");
+    assert.equal(finding.confirmations.length, before);
+  }
+});
+
+test("detector exit codes distinguish matches, no matches and execution errors without changing legacy checks", () => {
+  const check = { expect: "exit-nonzero", timeoutMs: 1000, errorExitCodes: [2] };
+  assert.equal(evaluateCheckRun(check, ok({ status: 0 })).reproduced, true);
+  assert.equal(evaluateCheckRun(check, ok({ status: 1 })).reproduced, false);
+  assert.equal(evaluateCheckRun(check, ok({ status: 2 })).ran, false);
+  // A stored pattern without the new opt-in policy keeps its original meaning.
+  assert.equal(evaluateCheckRun({ expect: "exit-nonzero" }, ok({ status: 2 })).reproduced, false);
 });
 
 test("a no-output check that dies silently is an error, not a clean project", () => {
@@ -265,6 +299,124 @@ test("a completed clean run turns the matrix cell from unknown into clean", () =
   const cell = buildFindingsMatrix(state).rows[0].cells[0];
   assert.equal(cell.cell, "clean");
   assert.match(cell.reason, /swept .* @ 0123456789ab/);
+});
+
+test("changing a check cannot reuse its previous clean result and rerunning restores evidence", () => {
+  const { state, project } = setup();
+  const pattern = mechanicalPattern(state);
+  stubbedSweep(state, ok());
+  const previous = structuredClone(findSweep(project, pattern.key));
+
+  setPattern(state, pattern.key, { check: { ...pattern.check, argv: ["node", "different-check.mjs"] } });
+  const outdated = buildFindingsMatrix(state).rows[0].cells[0];
+  assert.equal(outdated.cell, "unknown");
+  assert.match(outdated.reason, /definition changed.*rerun/i);
+  assert.deepEqual(findSweep(project, pattern.key), previous);
+
+  stubbedSweep(state, ok());
+  assert.equal(buildFindingsMatrix(state).rows[0].cells[0].cell, "clean");
+});
+
+test("a new error exit policy cannot inherit clean from the old detector policy", () => {
+  const { state } = setup();
+  const pattern = mechanicalPattern(state, { check: { argv: ["grep", "needle", "target.txt"], expect: "exit-nonzero" } });
+  stubbedSweep(state, ok({ status: 2 }));
+  assert.equal(buildFindingsMatrix(state).rows[0].cells[0].cell, "clean");
+  setPattern(state, pattern.key, { check: { ...pattern.check, errorExitCodes: [2] } });
+  assert.equal(buildFindingsMatrix(state).rows[0].cells[0].cell, "unknown");
+  assert.equal(stubbedSweep(state, ok({ status: 2 })).rows[0].outcome, "error");
+});
+
+test("changing required services invalidates clean but label edits keep it", () => {
+  const { state, project } = setup({ vercel: "fixture" });
+  const pattern = mechanicalPattern(state);
+  stubbedSweep(state, ok());
+  setPattern(state, pattern.key, { title: "Updated display title", severity: "low" });
+  assert.equal(buildFindingsMatrix(state).rows[0].cells[0].cell, "clean");
+  setPattern(state, pattern.key, { appliesTo: { requires: ["vercel"] } });
+  assert.equal(buildFindingsMatrix(state).rows[0].cells[0].cell, "unknown");
+  assert.equal(findSweep(project, pattern.key).outcome, "clean");
+});
+
+test("legacy sweep records stay readable but need a rerun before asserting clean", () => {
+  const { state, project } = setup();
+  const pattern = mechanicalPattern(state);
+  project.sweeps.push({ patternKey: pattern.key, outcome: "clean", commit: COMMIT, ranAt: "2026-10-01T00:00:00.000Z" });
+  const cell = buildFindingsMatrix(state).rows[0].cells[0];
+  assert.equal(cell.cell, "unknown");
+  assert.match(cell.reason, /definition.*not recorded.*rerun/i);
+  assert.equal(project.sweeps[0].outcome, "clean");
+});
+
+test("equivalent check defaults and service ordering retain valid clean evidence", () => {
+  const { state } = setup({ vercel: "fixture", supabase: "fixture" });
+  const pattern = mechanicalPattern(state, {
+    check: { argv: ["node", "check.mjs"] },
+    appliesTo: { requires: ["vercel", "supabase"] }
+  });
+  stubbedSweep(state, ok());
+  setPattern(state, pattern.key, {
+    check: { argv: ["node", "check.mjs"], cwd: "repo", timeoutMs: 60000, expect: "exit-zero", errorExitCodes: [] },
+    appliesTo: { requires: ["supabase", "vercel", "supabase"] }
+  });
+  assert.equal(buildFindingsMatrix(state).rows[0].cells[0].cell, "clean");
+});
+
+test("clean definition evidence survives saving and reloading schema 3", (t) => {
+  const { state } = setup();
+  mechanicalPattern(state);
+  stubbedSweep(state, ok());
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sumi-sweep-definition-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "state.json");
+  saveState(state, file);
+  const reloaded = loadState(file);
+  assert.equal(reloaded.schemaVersion, 3);
+  assert.equal(reloaded.migratedFrom, undefined);
+  assert.equal(buildFindingsMatrix(reloaded).rows[0].cells[0].cell, "clean");
+});
+
+test("a check changed to a judgment question asks for review instead of an impossible sweep", () => {
+  const { state } = setup();
+  const pattern = mechanicalPattern(state);
+  stubbedSweep(state, ok());
+  setPattern(state, pattern.key, { check: null });
+  const matrix = buildFindingsMatrix(state);
+  assert.equal(matrix.rows[0].cells[0].cell, "unknown");
+  const output = formatFindingsMatrix(matrix);
+  assert.match(output, /RECHECK REQUIRED/);
+  assert.match(output, /judgment question/);
+  assert.match(output, /sumi pattern show supabase-rls-off/);
+  assert.doesNotMatch(output, /sumi sweep supabase-rls-off/);
+});
+
+test("a past clean sweep cannot answer a service that is now unregistered", () => {
+  const { state, project } = setup({ supabase: "musubu-prod" });
+  mechanicalPattern(state, { appliesTo: { requires: ["supabase"] } });
+  stubbedSweep(state, ok());
+  assert.equal(buildFindingsMatrix(state).rows[0].cells[0].cell, "clean");
+
+  project.supabase = null;
+  const skipped = stubbedSweep(state, ok());
+  assert.equal(skipped.rows[0].outcome, "skipped");
+  // Skipping preserves the old evidence, but it cannot answer today's setup gap.
+  assert.equal(findSweep(project, "supabase-rls-off").outcome, "clean");
+  const unknown = buildFindingsMatrix(state).rows[0].cells[0];
+  assert.equal(unknown.cell, "unknown");
+  assert.equal(unknown.reason, "service unregistered: supabase");
+
+  project.supabase = SERVICE_UNUSED;
+  assert.equal(buildFindingsMatrix(state).rows[0].cells[0].cell, "n/a");
+});
+
+test("a past error sweep does not hide a currently unregistered service", () => {
+  const { state, project } = setup({ supabase: "musubu-prod" });
+  mechanicalPattern(state, { appliesTo: { requires: ["supabase"] } });
+  stubbedSweep(state, ok({ status: null, error: "spawn ENOENT" }));
+  project.supabase = null;
+  const cell = buildFindingsMatrix(state).rows[0].cells[0];
+  assert.equal(cell.cell, "unknown");
+  assert.equal(cell.reason, "service unregistered: supabase");
 });
 
 test("one sweep record per pattern per project, replaced by the next run", () => {

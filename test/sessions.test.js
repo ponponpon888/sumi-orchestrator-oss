@@ -7,18 +7,25 @@ import { execFileSync } from "node:child_process";
 import { addScopeCriterion, createProject, setScopeCriterionStatus } from "../src/domain.js";
 import { getActiveClaim } from "../src/claims.js";
 import {
-  buildSessionPrompt,
+  createSessionTestContext,
   cleanupSessionWorkspace,
-  finishSession,
   formatSessions,
-  ingestSessionResult,
+  ingestSessionResult as ingestSessionResultProduction,
   inspectSessionWorkspace,
   listSessions,
-  renewSession,
-  startSession
+  startSession as startSessionProduction,
 } from "../src/sessions.js";
 
 const NOW = new Date("2026-09-11T09:00:00.000Z");
+const sessionTest = createSessionTestContext(() => new Date());
+const {
+  buildSessionPrompt,
+  finishSession,
+  ingestSessionResult,
+  renewSession,
+  startSession,
+  validateSessionLease
+} = sessionTest;
 
 function project(id = "app", local = `C:\\Dev\\${id}`) {
   const p = createProject({ id, name: id.toUpperCase(), repo: `owner/${id}`, local });
@@ -74,6 +81,109 @@ test("session renew extends its lease", () => {
   assert.equal(getActiveClaim(item, { now: later })?.sessionId, "S001");
 });
 
+test("expired session lease renews when the claim still exactly matches its session", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSession(p, item.id, { agent: "claude-code", worktree: false, ttlMinutes: 1, now: NOW });
+  const renewedAt = new Date("2026-09-11T09:02:00.000Z");
+
+  const renewed = renewSession(p, started.session.id, { ttlMinutes: 30, now: renewedAt });
+
+  assert.equal(renewed.claim.sessionId, started.session.id);
+  assert.equal(renewed.claim.owner, started.session.owner);
+  assert.equal(renewed.claim.agent, started.session.agent);
+  assert.equal(renewed.claim.expiresAt, "2026-09-11T09:32:00.000Z");
+});
+
+test("session lease validation requires exact session, owner, and agent ownership", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSession(p, item.id, { agent: "claude-code", worktree: false, now: NOW });
+
+  item.claim.owner = "other-owner";
+  assert.throws(() => validateSessionLease(p, started.session.id, { now: NOW }), /active lease/);
+
+  item.claim.owner = started.session.owner;
+  item.claim.agent = "browser";
+  assert.throws(() => validateSessionLease(p, started.session.id, { now: NOW }), /active lease/);
+
+  item.claim.agent = started.session.agent;
+  item.claim.sessionId = "S999";
+  assert.throws(() => validateSessionLease(p, started.session.id, { now: NOW }), /active lease/);
+
+  delete item.claim;
+  assert.throws(() => validateSessionLease(p, started.session.id, { now: NOW }), /active lease/);
+});
+
+test("session renew rejects a claim owned by another session, owner, or agent", () => {
+  const mutations = [
+    ["sessionId", "S999"],
+    ["owner", "other-owner"],
+    ["agent", "browser"]
+  ];
+
+  for (const [field, value] of mutations) {
+    const p = project();
+    const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+    const started = startSession(p, item.id, { agent: "claude-code", worktree: false, now: NOW });
+    item.claim[field] = value;
+
+    assert.throws(
+      () => renewSession(p, started.session.id, { ttlMinutes: 30, now: NOW }),
+      /not owned by session/
+    );
+  }
+
+  const missingClaimProject = project();
+  const missingClaimItem = addScopeCriterion(missingClaimProject, "Implement authentication middleware", "todo");
+  const missingClaimSession = startSession(missingClaimProject, missingClaimItem.id, {
+    agent: "claude-code", worktree: false, now: NOW
+  });
+  delete missingClaimItem.claim;
+  assert.throws(
+    () => renewSession(missingClaimProject, missingClaimSession.session.id, { ttlMinutes: 30, now: NOW }),
+    /not owned by session/
+  );
+});
+
+test("expired session lease is rejected before prompt generation", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSession(p, item.id, { agent: "claude-code", worktree: false, ttlMinutes: 1, now: NOW });
+
+  assert.throws(() => buildSessionPrompt(p, started.session.id, {
+    now: new Date("2026-09-11T09:02:00.000Z")
+  }), /active lease/);
+});
+
+test("prompt generation is rejected when the session loses ownership", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSession(p, item.id, { agent: "claude-code", worktree: false, now: NOW });
+  item.claim.sessionId = "S999";
+
+  assert.throws(() => buildSessionPrompt(p, started.session.id, { now: NOW }), /active lease/);
+});
+
+test("prompt generation is rejected when the lease expiry is invalid", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSession(p, item.id, { agent: "claude-code", worktree: false, now: NOW });
+  item.claim.expiresAt = "not-a-date";
+
+  assert.throws(() => buildSessionPrompt(p, started.session.id, { now: NOW }), /active lease/);
+});
+
+test("prompt generation succeeds while the session lease is valid", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSession(p, item.id, { agent: "claude-code", worktree: false, now: NOW });
+
+  const prompt = buildSessionPrompt(p, started.session.id, { now: NOW });
+  assert.match(prompt, /Execution session/);
+  assert.match(prompt, /S001/);
+});
+
 test("finishing a session releases only its own claim", () => {
   const p = project();
   const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
@@ -98,7 +208,7 @@ test("code-agent session creates an isolated git worktree and cleanup removes it
   assert.match(workspace.branch, /^sumi\/app\/c001-s001$/);
   assert.throws(() => cleanupSessionWorkspace(p, started.session.id, { now: NOW }), /is active/);
 
-  const prompt = buildSessionPrompt(p, started.session.id);
+  const prompt = buildSessionPrompt(p, started.session.id, { now: NOW });
   assert.match(prompt, /Execution session/);
   assert.match(prompt, /Do not modify the primary worktree/);
   assert.match(prompt, /S001/);
@@ -185,6 +295,64 @@ test("session result inherits session agent/scope and links result to the sessio
   assert.equal(outcome.session.status, "active");
 });
 
+test("expired session result is rejected before changing scope or result history", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSession(p, item.id, { worktree: false, ttlMinutes: 1, now: NOW });
+  const claimBefore = structuredClone(item.claim);
+
+  assert.throws(() => ingestSessionResult(p, started.session.id, "C001 can move to done.", {
+    apply: true,
+    finish: true,
+    now: new Date("2026-09-11T09:02:00.000Z")
+  }), /active lease/);
+  assert.equal(item.status, "todo");
+  assert.deepEqual(item.claim, claimBefore);
+  assert.equal(p.agentResults.length, 0);
+  assert.equal(started.session.status, "active");
+});
+
+test("session result is rejected when the claim belongs to another session", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSession(p, item.id, { worktree: false, now: NOW });
+  item.claim.sessionId = "S999";
+
+  assert.throws(() => ingestSessionResult(p, started.session.id, "C001 can move to done.", {
+    apply: true,
+    now: NOW
+  }), /active lease/);
+  assert.equal(item.status, "todo");
+  assert.equal(p.agentResults.length, 0);
+});
+
+test("session result is rejected when the claim expiry is invalid", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSession(p, item.id, { worktree: false, now: NOW });
+  item.claim.expiresAt = "not-a-date";
+
+  assert.throws(() => ingestSessionResult(p, started.session.id, "C001 can move to done.", { now: NOW }), /active lease/);
+  assert.equal(item.status, "todo");
+  assert.equal(p.agentResults.length, 0);
+});
+
+test("renewed session can ingest a result after its original lease expired", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSession(p, item.id, { worktree: false, ttlMinutes: 1, now: NOW });
+  const renewedAt = new Date("2026-09-11T09:02:00.000Z");
+  renewSession(p, started.session.id, { ttlMinutes: 30, now: renewedAt });
+
+  const outcome = ingestSessionResult(p, started.session.id, "C001 can move to done.", {
+    apply: true,
+    now: renewedAt
+  });
+  assert.equal(outcome.result.sessionId, started.session.id);
+  assert.equal(item.status, "done");
+  assert.equal(p.agentResults.length, 1);
+});
+
 test("session result apply automatically closes session when the scope gate becomes done", () => {
   const p = project();
   const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
@@ -204,6 +372,30 @@ test("session result --finish semantics release the lease while leaving an open 
   assert.equal(item.status, "todo");
   assert.equal(outcome.session.status, "completed");
   assert.equal(item.claim, undefined);
+});
+
+test("future minimumNow cannot move public session audit timestamps forward", () => {
+  const p = project();
+  const item = addScopeCriterion(p, "Implement authentication middleware", "todo");
+  const started = startSessionProduction(p, item.id, { agent: "claude-code", worktree: false, ttlMinutes: 10 });
+  const before = Date.now();
+  const future = new Date(before + 5 * 60_000);
+  const outcome = ingestSessionResultProduction(p, started.session.id, "Reviewed the current implementation. More work remains.", {
+    apply: true,
+    finish: true,
+    minimumNow: future
+  });
+
+  const after = Date.now();
+  for (const [label, value] of [
+    ["appliedAt", outcome.result.appliedAt],
+    ["endedAt", outcome.session.endedAt],
+    ["claim updatedAt", item.updatedAt]
+  ]) {
+    const timestamp = Date.parse(value);
+    assert.ok(timestamp >= before && timestamp <= after, `${label} must come from the production clock`);
+    assert.ok(timestamp < future.getTime(), `${label} must not use minimumNow`);
+  }
 });
 
 test("ended session rejects duplicate result ingestion", () => {

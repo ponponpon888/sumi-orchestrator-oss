@@ -3,6 +3,9 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { getCompletion, getServiceState, isProductionObservable, SERVICE_UNUSED, touch } from "./domain.js";
 import { classifyAction } from "./next.js";
+import { countCommitsSince, createGithubApi, createGithubTextApi, getBranchHead, getCommitChecks, getDefaultBranch, getVercelStatuses, listBranchCommits, listOpenPulls, listRecentMergedPulls, listRunJobs, listRuns, listWorkflows } from "./github.js";
+import { assessCiHealth, assessDeployHealth, classifyVercelStatus, DEPLOY_SCAN_COMMITS } from "./health.js";
+import { isGithubSource, refreshMirror } from "./mirror.js";
 
 const commandPathCache = new Map();
 
@@ -64,8 +67,34 @@ function trimTrailingWhitespace(value) {
   return String(value ?? "").replace(/\s+$/, "");
 }
 
+/**
+ * The inherited git variables that say WHICH repository to operate on.
+ * Hooks and `git rebase --exec` set them, and any git run with them would act
+ * on the caller's repository instead of the directory SUMI named. Only these
+ * are dropped: credentials, CA bundles, askpass and ssh settings are kept.
+ */
+export const GIT_LOCATION_VARS = Object.freeze([
+  "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+  "GIT_PREFIX", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM"
+]);
+
+const GIT_ISOLATED = { dropEnv: GIT_LOCATION_VARS };
+
+function buildEnv(options) {
+  const env = { ...process.env, CI: process.env.CI || "1" };
+  const drop = new Set((options.dropEnv || []).map((key) => key.toUpperCase()));
+  for (const key of Object.keys(env)) if (drop.has(key.toUpperCase())) delete env[key];
+  // envDefaults only fill what the caller's environment does not set.
+  for (const [key, value] of Object.entries(options.envDefaults || {})) {
+    if (!Object.keys(env).some((name) => name.toUpperCase() === key.toUpperCase())) env[key] = value;
+  }
+  return { ...env, ...(options.env || {}) };
+}
+
 export function runCommand(command, args, options = {}) {
-  const resolved = resolveCommand(command) || command;
+  // resolve:false spawns an absolute path as given, without a PATH lookup.
+  const resolved = options.resolve === false ? command : (resolveCommand(command) || command);
   let invocation;
   try {
     invocation = buildSpawnInvocation(resolved, args);
@@ -75,11 +104,13 @@ export function runCommand(command, args, options = {}) {
   const result = spawnSync(invocation.command, invocation.args, {
     cwd: options.cwd,
     encoding: "utf8",
+    // Observation and mechanical checks are non-interactive.
+    stdio: ["ignore", "pipe", "pipe"],
     shell: invocation.shell,
     windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     windowsHide: true,
     timeout: options.timeout ?? 15000,
-    env: { ...process.env, CI: process.env.CI || "1" },
+    env: buildEnv(options),
     maxBuffer: 1024 * 1024 * 4
   });
   return {
@@ -447,10 +478,12 @@ function sameCommit(left, right) {
   return Boolean(left && right && String(left).toLowerCase() === String(right).toLowerCase());
 }
 
-export function selectCurrentOpenPr(list, branch, commitSha = null) {
+export function selectCurrentOpenPr(list, branch, commitSha = null, repo = null) {
   if (!branch || !Array.isArray(list)) return null;
   const matches = list.filter((pr) =>
-    pr?.headRefName === branch && String(pr.state || "OPEN").toUpperCase() === "OPEN"
+    pr?.headRefName === branch && String(pr.state || "OPEN").toUpperCase() === "OPEN" &&
+    // A fork's PR can use the same branch name; its CI is not this branch's.
+    (!repo || !pr.headRepo || String(pr.headRepo).toLowerCase() === String(repo).toLowerCase())
   );
   if (!matches.length) return null;
   return matches.find((pr) => sameCommit(pr.headRefOid, commitSha)) || matches[0];
@@ -503,99 +536,126 @@ export function aggregateGithubCi(project, observations) {
   return deployment.ci;
 }
 
-function syncBaselineCi(project, observations) {
-  const repo = runCommand("gh", ["api", `repos/${project.repo}`, "--jq", ".default_branch"]);
-  if (!repo.ok || !repo.stdout) {
-    observations.warnings.push(`Default branch lookup skipped: ${repo.stderr || repo.error || "unknown error"}`);
+function syncBaselineCi(project, observations, api) {
+  const branch = getDefaultBranch(api, project.repo);
+  if (!branch.ok) {
+    observations.warnings.push(`Default branch lookup skipped: ${branch.error}`);
     return;
   }
-  const defaultBranch = repo.stdout.trim();
-  const result = runCommand("gh", [
-    "run", "list", "--repo", project.repo, "--branch", defaultBranch, "--limit", "20",
-    "--json", "databaseId,name,workflowName,status,conclusion,url,event,headSha"
-  ]);
-  if (!result.ok) {
-    observations.warnings.push(`Baseline CI sync skipped: ${result.stderr || result.error || "unknown error"}`);
+  observations.github.deployHealth = observeDeployHealth(project, observations, api, branch.data);
+  const runs = listRuns(api, project.repo, { branch: branch.data, perPage: 20 });
+  if (!runs.ok) {
+    observations.warnings.push(`Baseline CI sync skipped: ${runs.error}`);
     return;
   }
-  try {
-    const runs = JSON.parse(result.stdout || "[]");
-    observations.github.baselineCi = summarizeBaselineCi(defaultBranch, runs);
+  observations.github.baselineCi = summarizeBaselineCi(branch.data, runs.data);
+  observations.github.ciHealth = observeCiHealth(project, observations, api, branch.data, runs.data);
+  const failedWorkflow = observations.github.workflowRuns?.find((r) => String(r.conclusion || "").toLowerCase() === "failure");
+  if (project.deployment.ci === "failed" && observations.github.baselineCi.status === "failed") {
+    const currentName = failedWorkflow?.workflowName || failedWorkflow?.name || null;
+    const baseName = observations.github.baselineCi.workflowName;
+    observations.github.baselineFailureLikely = !currentName || !baseName || currentName === baseName;
+  }
+}
 
-    const failedWorkflow = observations.github.workflowRuns?.find((r) => String(r.conclusion || "").toLowerCase() === "failure");
-    if (project.deployment.ci === "failed" && observations.github.baselineCi.status === "failed") {
-      const currentName = failedWorkflow?.workflowName || failedWorkflow?.name || null;
-      const baseName = observations.github.baselineCi.workflowName;
-      observations.github.baselineFailureLikely = !currentName || !baseName || currentName === baseName;
+/**
+ * Whether the default branch's latest commit reached production, from the
+ * statuses Vercel's Git integration posts on GitHub. Skipped for a project
+ * registered as not using Vercel.
+ */
+function observeDeployHealth(project, observations, api, branch, now = new Date()) {
+  if (getServiceState(project, "vercel").state === "unused") return null;
+  const listed = listBranchCommits(api, project.repo, branch, DEPLOY_SCAN_COMMITS);
+  if (!listed.ok) {
+    observations.warnings.push(`Production deploy state unknown: ${listed.error}`);
+    return assessDeployHealth({ branch, now });
+  }
+  const commits = listed.data.map((commit) => ({ ...commit, statuses: null }));
+  const deployed = new Set();
+  const seen = new Set();
+  let truncated = false;
+  for (const commit of commits) {
+    const statuses = getVercelStatuses(api, project.repo, commit.sha);
+    if (!statuses.ok) {
+      if (commit === commits[0]) {
+        observations.warnings.push(`Production deploy state unknown: ${statuses.error}`);
+        return assessDeployHealth({ branch, now });
+      }
+      observations.warnings.push(`Production deploy scan stopped at ${commit.sha.slice(0, 12)}: ${statuses.error}`);
+      truncated = true;
+      break;
     }
-  } catch {
-    observations.warnings.push("Baseline CI JSON could not be parsed");
+    commit.statuses = statuses.data;
+    for (const status of statuses.data) {
+      seen.add(status.context);
+      if (classifyVercelStatus(status) === "deployed") deployed.add(status.context);
+    }
+    if (seen.size && [...seen].every((context) => deployed.has(context))) break;
   }
+  return assessDeployHealth({ branch, commits: commits.filter((commit) => commit.statuses), scanLimit: DEPLOY_SCAN_COMMITS, truncated, now });
 }
 
-function syncRecentMergedPrs(project, observations) {
-  const result = runCommand("gh", [
-    "pr", "list", "--repo", project.repo,
-    "--state", "merged", "--limit", "8",
-    "--json", "number,title,mergedAt,url,headRefName"
-  ]);
-  if (!result.ok) {
-    observations.warnings.push(`Recent merged PR sync skipped: ${result.stderr || result.error || "unknown error"}`);
+/**
+ * Whether CI is still running on the default branch at all. Read from
+ * GitHub, not from the local or mirrored checkout, so a stale clone cannot
+ * make a stopped CI look current.
+ */
+function observeCiHealth(project, observations, api, branch, runs, now = new Date()) {
+  const unknown = (why) => {
+    observations.warnings.push(`CI health unknown: ${why}`);
+    return assessCiHealth({ branch, now });
+  };
+  const workflows = listWorkflows(api, project.repo);
+  if (!workflows.ok) return unknown(workflows.error);
+  const head = getBranchHead(api, project.repo, branch);
+  if (!head.ok) return unknown(head.error);
+  let aheadBy = null;
+  const lastSha = runs[0]?.headSha || null;
+  if (lastSha && String(lastSha).toLowerCase() !== head.data.sha.toLowerCase()) {
+    const since = countCommitsSince(api, project.repo, lastSha, head.data.sha);
+    if (since.ok) aheadBy = since.data;
+    else observations.warnings.push(`CI health: commits since the last run are unknown: ${since.error}`);
+  }
+  return assessCiHealth({ branch, workflows: workflows.data, runs, head: head.data, aheadBy, now });
+}
+
+function syncRecentMergedPrs(project, observations, api) {
+  const merged = listRecentMergedPulls(api, project.repo, 8);
+  if (!merged.ok) {
+    observations.warnings.push(`Recent merged PR sync skipped: ${merged.error}`);
     return;
   }
-  try {
-    observations.github.recentMergedPrs = JSON.parse(result.stdout || "[]").map((pr) => ({
-      number: pr.number,
-      title: pr.title,
-      mergedAt: pr.mergedAt || null,
-      url: pr.url || null,
-      headRefName: pr.headRefName || null
-    }));
-  } catch {
-    observations.warnings.push("Recent merged PR JSON could not be parsed");
-  }
+  observations.github.recentMergedPrs = merged.data;
 }
 
-function syncGithubRunDetails(project, observations, commitSha) {
+function syncGithubRunDetails(project, observations, commitSha, api, textApi) {
   if (!commitSha) return;
-  const runsResult = runCommand("gh", [
-    "run", "list", "--repo", project.repo,
-    "--commit", commitSha, "--limit", "5",
-    "--json", "databaseId,name,workflowName,status,conclusion,url,event,headSha"
-  ]);
-  if (!runsResult.ok) {
-    observations.warnings.push(`GitHub Actions run detail sync skipped: ${runsResult.stderr || runsResult.error || "unknown error"}`);
+  const runs = listRuns(api, project.repo, { headSha: commitSha, perPage: 5 });
+  if (!runs.ok) {
+    observations.warnings.push(`GitHub Actions run detail sync skipped: ${runs.error}`);
     return;
   }
+  observations.github.workflowRuns = runs.data;
+  const failedRun = runs.data.find((r) => String(r.conclusion || "").toLowerCase() === "failure");
+  if (!failedRun) return;
 
-  try {
-    const runs = JSON.parse(runsResult.stdout || "[]");
-    observations.github.workflowRuns = runs;
-    const failedRun = runs.find((r) => String(r.conclusion || "").toLowerCase() === "failure");
-    if (!failedRun) return;
-
-    const view = runCommand("gh", ["run", "view", String(failedRun.databaseId), "--repo", project.repo, "--json", "jobs,status,conclusion,url,name"]);
-    if (view.ok) {
-      const detail = JSON.parse(view.stdout || "{}");
-      const jobs = Array.isArray(detail.jobs) ? detail.jobs : [];
-      observations.github.failedJobs = jobs
-        .filter((job) => String(job.conclusion || "").toLowerCase() === "failure")
-        .map((job) => ({
-          name: job.name || "job",
-          conclusion: job.conclusion || null,
-          url: job.url || null,
-          failedSteps: (job.steps || []).filter((step) => String(step.conclusion || "").toLowerCase() === "failure").map((step) => step.name || "step")
-        }));
-    } else {
-      observations.warnings.push(`GitHub Actions failed-job detail unavailable: ${view.stderr || view.error || "unknown error"}`);
-    }
-
-    const logs = runCommand("gh", ["run", "view", String(failedRun.databaseId), "--repo", project.repo, "--log-failed"]);
-    if (logs.ok) observations.github.ciFailureSummary = summarizeFailureLog(logs.stdout);
-    else observations.github.ciFailureLogAvailable = false;
-  } catch {
-    observations.warnings.push("GitHub Actions detail JSON could not be parsed");
+  const jobs = listRunJobs(api, project.repo, failedRun.databaseId);
+  if (!jobs.ok) {
+    observations.warnings.push(`GitHub Actions failed-job detail unavailable: ${jobs.error}`);
+    return;
   }
+  const failedJobs = jobs.data.filter((job) => String(job.conclusion || "").toLowerCase() === "failure");
+  observations.github.failedJobs = failedJobs.map((job) => ({
+    name: job.name,
+    conclusion: job.conclusion,
+    url: job.url,
+    failedSteps: job.steps.filter((step) => String(step.conclusion || "").toLowerCase() === "failure").map((step) => step.name)
+  }));
+  // A job's log is served from a redirect that some networks cannot follow;
+  // without it the failure summary is simply unavailable, never invented.
+  const logs = failedJobs[0] ? textApi(`repos/${project.repo}/actions/jobs/${failedJobs[0].id}/logs`) : { ok: false };
+  if (logs.ok) observations.github.ciFailureSummary = summarizeFailureLog(logs.data);
+  else observations.github.ciFailureLogAvailable = false;
 }
 
 
@@ -666,7 +726,7 @@ export function syncProject(project, options = {}) {
     github: {
       source: "none", ghAvailable: false, openPrTitle: null, openPrBody: null, openPrUrl: null, openPrState: null,
       checks: [], workflowRuns: [], failedJobs: [], ciFailureSummary: [], ciFailureLogAvailable: true, recentMergedPrs: [],
-      baselineCi: null, baselineFailureLikely: false, prListObserved: false
+      baselineCi: null, baselineFailureLikely: false, prListObserved: false, ciHealth: null, deployHealth: null
     },
     vercel: { linked: false, projectId: null, orgId: null, projectName: null, cliAvailable: false, preview: null, production: null },
     supabase: { configured: getServiceState(project, "supabase").state === "registered", cliAvailable: false, found: false, status: null, healthy: null, name: null, region: null },
@@ -675,19 +735,60 @@ export function syncProject(project, options = {}) {
     inferredNext: [], warnings: []
   };
 
-  if (!project.local) observations.warnings.push("local path is not configured");
-  else if (!fs.existsSync(project.local)) observations.warnings.push(`local path not found: ${project.local}`);
+  // A GitHub-source project is observed through SUMI's mirror of the
+  // default branch, refreshed first. If the refresh fails nothing local is
+  // observed: the last known commit stays as it was and the warning says
+  // why, instead of the mirror's older state being reported as current.
+  let workPath = project.local;
+  let mirror = null;
+  if (isGithubSource(project)) {
+    mirror = (options.refreshMirror || refreshMirror)(project);
+    observations.source = mirror.ok
+      ? { kind: "github", path: mirror.path, branch: mirror.branch, commit: mirror.commit, refreshedAt: observedAt }
+      : {
+        kind: "github",
+        error: mirror.reason,
+        // Survives repeated failures: the commit is cleared after the first.
+        lastKnownCommit: project.deployment.commit || project.observations?.source?.lastKnownCommit || null
+      };
+    workPath = mirror.ok ? mirror.path : null;
+    if (!mirror.ok) {
+      observations.warnings.push(`GitHub mirror refresh failed: ${mirror.reason}`);
+      // Other gates (browser verification, session base) read
+      // deployment.commit as "the current commit". After a failed refresh
+      // SUMI does not know it, so it is cleared rather than left stale; the
+      // last commit SUMI did see is kept under observations.source. Every
+      // verdict that was about that commit goes with it: CI or a preview
+      // "ready" for an unknown commit would be an answer about nothing.
+      project.deployment.commit = null;
+      project.deployment.pr = null;
+      project.deployment.ci = "unknown";
+      project.deployment.preview = "unknown";
+    }
+  } else {
+    observations.source = { kind: "local" };
+  }
+
+  if (!workPath) {
+    if (!isGithubSource(project)) observations.warnings.push("local path is not configured");
+  } else if (!fs.existsSync(workPath)) observations.warnings.push(`local path not found: ${workPath}`);
   else {
     observations.local.available = true;
-    const inside = runCommand("git", ["-C", project.local, "rev-parse", "--is-inside-work-tree"]);
+    const inside = runCommand("git", ["-C", workPath, "rev-parse", "--is-inside-work-tree"], GIT_ISOLATED);
     if (inside.ok && inside.stdout === "true") {
       observations.local.git = true;
-      const branch = runCommand("git", ["-C", project.local, "branch", "--show-current"]);
-      const commit = runCommand("git", ["-C", project.local, "rev-parse", "HEAD"]);
-      const subject = runCommand("git", ["-C", project.local, "log", "-1", "--pretty=%s"]);
-      const porcelain = runCommand("git", ["-C", project.local, "status", "--porcelain"]);
-      if (branch.ok && branch.stdout) project.deployment.branch = branch.stdout;
-      if (commit.ok && commit.stdout) project.deployment.commit = commit.stdout;
+      const branch = runCommand("git", ["-C", workPath, "branch", "--show-current"], GIT_ISOLATED);
+      const commit = runCommand("git", ["-C", workPath, "rev-parse", "HEAD"], GIT_ISOLATED);
+      const subject = runCommand("git", ["-C", workPath, "log", "-1", "--pretty=%s"], GIT_ISOLATED);
+      const porcelain = runCommand("git", ["-C", workPath, "status", "--porcelain"], GIT_ISOLATED);
+      if (mirror?.ok) {
+        // The mirror is detached at the remote head; name the branch it tracks.
+        project.deployment.branch = mirror.branch;
+        project.deployment.commit = mirror.commit;
+      } else {
+        if (branch.ok && branch.stdout) project.deployment.branch = branch.stdout;
+        if (commit.ok && commit.stdout) project.deployment.commit = commit.stdout;
+      }
       if (subject.ok) observations.local.lastCommitSubject = subject.stdout || null;
       if (porcelain.ok) {
         const allChanges = parseGitPorcelain(porcelain.stdout);
@@ -700,7 +801,7 @@ export function syncProject(project, options = {}) {
       }
     } else observations.warnings.push("local path is not a Git worktree");
 
-    const vercel = readVercelLink(project.local);
+    const vercel = mirror ? null : readVercelLink(workPath);
     if (vercel) {
       observations.vercel = { linked: true, ...vercel };
       const service = getServiceState(project, "vercel");
@@ -713,39 +814,45 @@ export function syncProject(project, options = {}) {
     }
   }
 
-  observations.github.ghAvailable = commandExists("gh");
+  observations.github.ghAvailable = options.githubApi ? true : commandExists("gh");
   if (project.repo && observations.github.ghAvailable) {
-    const prs = runCommand("gh", [
-      "pr", "list", "--repo", project.repo, "--state", "open", "--limit", "20",
-      "--json", "number,title,body,state,headRefName,headRefOid,url,statusCheckRollup"
-    ]);
+    // REST only (`gh api`): GraphQL-backed `gh pr` / `gh run` commands are not
+    // reachable from every environment SUMI runs in.
+    const api = options.githubApi || createGithubApi();
+    const textApi = options.githubTextApi || createGithubTextApi();
+    const prs = listOpenPulls(api, project.repo);
     if (prs.ok) {
-      observations.github.source = "gh";
-      try {
-        const list = JSON.parse(prs.stdout || "[]");
-        observations.github.prListObserved = true;
-        const branch = project.deployment.branch;
-        const current = selectCurrentOpenPr(list, branch, project.deployment.commit);
-        if (current) {
-          project.deployment.pr = Number(current.number);
-          project.deployment.ci = mapChecks(current.statusCheckRollup);
-          observations.github.openPrTitle = current.title || null;
-          observations.github.openPrBody = current.body || null;
-          observations.github.openPrUrl = current.url || null;
-          observations.github.openPrState = current.state || "OPEN";
-          observations.github.checks = summarizeChecks(current.statusCheckRollup);
-          observations.verification = inferManualVerification(current.body || "");
-          syncGithubRunDetails(project, observations, project.deployment.commit);
+      observations.github.source = "gh-api";
+      observations.github.prListObserved = true;
+      // A GitHub-source project's current work is its default branch at the
+      // mirrored commit; an open PR is not "current" there, and a fork PR
+      // from a branch called "main" must never stand in for main's own CI.
+      const current = isGithubSource(project)
+        ? null
+        : selectCurrentOpenPr(prs.data, project.deployment.branch, project.deployment.commit, project.repo);
+      if (current) {
+        project.deployment.pr = Number(current.number);
+        const checks = getCommitChecks(api, project.repo, current.headRefOid);
+        if (checks.ok) {
+          project.deployment.ci = mapChecks(checks.data);
+          observations.github.checks = summarizeChecks(checks.data);
         } else {
-          project.deployment.pr = null;
           project.deployment.ci = "unknown";
+          observations.warnings.push(`PR check sync skipped: ${checks.error}`);
         }
-      } catch {
-        observations.warnings.push("GitHub CLI returned unreadable PR JSON");
+        observations.github.openPrTitle = current.title || null;
+        observations.github.openPrBody = current.body || null;
+        observations.github.openPrUrl = current.url || null;
+        observations.github.openPrState = current.state || "OPEN";
+        observations.verification = inferManualVerification(current.body || "");
+        syncGithubRunDetails(project, observations, project.deployment.commit, api, textApi);
+      } else {
+        project.deployment.pr = null;
+        project.deployment.ci = "unknown";
       }
-    } else observations.warnings.push(`GitHub CLI sync failed: ${prs.stderr || prs.error || "unknown error"}`);
-    syncRecentMergedPrs(project, observations);
-    syncBaselineCi(project, observations);
+    } else observations.warnings.push(`GitHub sync failed: ${prs.error}`);
+    syncRecentMergedPrs(project, observations, api);
+    syncBaselineCi(project, observations, api);
     if (observations.github.prListObserved) aggregateGithubCi(project, observations);
   } else if (project.repo && !observations.github.ghAvailable) {
     observations.warnings.push("GitHub CLI (gh) is not installed; PR/CI sync skipped");

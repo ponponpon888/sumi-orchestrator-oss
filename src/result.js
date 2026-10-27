@@ -63,6 +63,38 @@ function hasNegatedDone(text) {
   return has(text, /\b(?:not|isn't|wasn't)\s+(?:yet\s+)?done\b|\b(?:must|should|do|may)\s+not\s+(?:be\s+)?(?:move(?:d)?|mark(?:ed)?|set|treat(?:ed)?)?(?:\s+to|\s+as)?\s*done\b|\b(?:cannot|can't)\s+(?:be\s+)?(?:move(?:d)?|mark(?:ed)?|set|treat(?:ed)?)?(?:\s+to|\s+as)?\s*done\b|done(?:に|へ)(?:移さない|しない)|完了(?:ではない|していない|扱いにしない)/i);
 }
 
+// Retain unscoped warnings, but keep another criterion's verdict out of the
+// target's disposition. Adjacent lists of IDs share the following verdict.
+function textForScope(text, scopeId) {
+  const target = scopeId.toUpperCase();
+  const parts = [];
+  for (const statement of text.split(/\r?\n|(?<=[.!?。！？])\s+/u)) {
+    const ids = [...statement.matchAll(/\bC\d{3,}\b/gi)];
+    if (!ids.length) {
+      parts.push(statement);
+      continue;
+    }
+    const groups = [];
+    for (const id of ids) {
+      const previous = groups.at(-1);
+      const between = previous && statement.slice(previous.end, id.index);
+      if (previous && /^\s*(?:and\b|[,&/、と])\s*$/i.test(between)) {
+        previous.ids.push(id[0].toUpperCase());
+        previous.end = id.index + id[0].length;
+      } else {
+        groups.push({ ids: [id[0].toUpperCase()], start: id.index, end: id.index + id[0].length });
+      }
+    }
+    groups.forEach((group, index) => {
+      if (!group.ids.includes(target)) return;
+      const prefix = index === 0 ? statement.slice(0, group.start) : "";
+      const verdict = statement.slice(group.end, groups[index + 1]?.start ?? statement.length);
+      parts.push(`${prefix}${scopeId}${verdict}`);
+    });
+  }
+  return parts.join("\n");
+}
+
 function browserPassDetails(text) {
   const details = [];
   for (const match of String(text || "").matchAll(/\bPASS\s*:\s*([^\r\n]+)/gi)) {
@@ -116,9 +148,10 @@ export function analyzeAgentResult(project, scopeId, text, { agent = "unknown" }
   let targetDisposition = null;
 
   const escapedId = scopeId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const blockerScanText = maskNegatedBlockerPhrases(normalized);
+  const dispositionText = textForScope(normalized, scopeId);
+  const blockerScanText = maskNegatedBlockerPhrases(dispositionText);
   const blockerDetail = explicitBlockerDetail(normalized);
-  const targetBlocked = new RegExp(`${escapedId}[\\s\\S]{0,120}\\bblocked\\b`, "i").test(blockerScanText);
+  const targetBlocked = new RegExp(`\\b${escapedId}\\b[\\s\\S]{0,120}\\bblocked\\b`, "i").test(blockerScanText);
   const positiveBlocked = has(blockerScanText, /\bblocked\b/i);
   const explicitBlocked = Boolean(blockerDetail || targetBlocked || positiveBlocked);
 
@@ -215,10 +248,10 @@ export function analyzeAgentResult(project, scopeId, text, { agent = "unknown" }
     }
   }
 
-  const keepOpen = new RegExp(`${escapedId}[\\s\\S]{0,100}(?:開いたまま|継続|stay\\s+open|remain\\s+open|keep\\s+open)`, "i").test(normalized);
-  const negativeDone = hasNegatedDone(normalized);
-  const changesRequired = has(normalized, /\bCHANGES_REQUIRED\b|\bREQUEST_CHANGES\b/i);
-  const explicitDone = new RegExp(`${escapedId}[\\s\\S]{0,100}(?:move\\s+to\\s+done|can\\s+move\\s+to\\s+done|done(?:に|へ)?|完了(?:扱い|に)?)`, "i").test(normalized);
+  const keepOpen = new RegExp(`\\b${escapedId}\\b[\\s\\S]{0,100}(?:開いたまま|継続|stays?\\s+open|remains?\\s+open|keeps?\\s+open)`, "i").test(dispositionText);
+  const negativeDone = hasNegatedDone(dispositionText.replace(/\bC\d{3,}\b/gi, ""));
+  const changesRequired = has(dispositionText, /\bCHANGES_REQUIRED\b|\bREQUEST_CHANGES\b/i);
+  const explicitDone = new RegExp(`\\b${escapedId}\\b[\\s\\S]{0,100}(?:\\bdone\\b(?:に|へ)?|完了(?:扱い|に)?)`, "i").test(dispositionText);
 
   if (explicitBlocked) {
     targetDisposition = {

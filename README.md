@@ -120,6 +120,9 @@ The v1 workflow is intentionally narrow:
 - `delivery-queue` — track the certified PR after merge through the exact production deployment and explicit verification
 - `releases` — preserve finalized delivery history across projects after scope/session lifecycle closure
 - `pattern` / `finding` / `findings` / `sweep` — keep a bug found in one project as a question asked of every project, run the mechanical questions across the portfolio, and apply fail-closed rules for when an answer may be called confirmed or fixed
+- `pattern import` / `finding export` — load those questions in bulk from [ai-workforce](https://github.com/ponponpon888/ai-workforce) pitfall records or SUMI's built-in checks (all-or-nothing), and turn a confirmed or fixed finding back into a draft record
+- `health` — one report, for every project, of whether CI still runs on the default branch and whether its latest commit reached production; what could not be observed is listed, never called fine
+- `--source github` — keep a project whose code lives only on GitHub: SUMI syncs and sweeps its own mirror of the default branch
 - project priority (`P1`–`P5`) — rank portfolio work before queue and batch assignment
 
 Browser automation and direct agent dispatch remain advanced/experimental. They are not required for the v1 workflow.
@@ -129,7 +132,8 @@ Browser automation and direct agent dispatch remain advanced/experimental. They 
 - [Per-project workflow](docs/per-project-workflow.md) — register a project, observe, declare completion Scope, route, ingest results, explain a status, hand off
 - [Portfolio view](docs/portfolio.md) — the cross-project queue, parallel batches, work leases, and the multi-project dashboard
 - [Execution sessions](docs/execution-sessions.md) — worktree isolation, the Review / Merge / Release / Delivery gates, and release history
-- [Cross-project bug hunt](docs/patterns-and-findings.md) — patterns, findings, `sweep`, and the rules for `confirmed` and `fixed`
+- [Cross-project bug hunt](docs/patterns-and-findings.md) — patterns, findings, `sweep`, importing and exporting pitfall records, and the rules for `confirmed` and `fixed`
+- [GitHub-source projects and health](docs/github-and-health.md) — projects that live only on GitHub, REST-only GitHub reads, CI health, production deploy health and `sumi health`
 - [Design notes](docs/DESIGN-v0.1.md) — the original design sketch
 - [Changelog](CHANGELOG.md) — release notes
 
@@ -155,6 +159,11 @@ Browser automation and direct agent dispatch remain advanced/experimental. They 
 - A sweep refuses to run against a dirty worktree, and a sweep that could not run leaves the cell `unknown` rather than `clean`.
 - A sweep that finds nothing records no confirmation, so it can never help confirm the finding it just contradicted.
 - A dismissed finding is not re-filed by the next sweep; only a reproduction after `fixed` opens a new one.
+- Pattern import writes all of a source or none of it, and never overwrites a pattern added or edited by hand.
+- A bundled check that crashes or cannot read its target is an execution error, never a reproduction or a clean run.
+- GitHub is read over REST only; a list read in part is `unknown`, never judged from the part that was read.
+- A health signal that could not be read is `unknown` and listed as not observed; it never raises an alert or counts as healthy.
+- An exported pitfall record is a draft: SUMI never publishes it, never copies a check's output into it, and refuses open high-severity holes.
 
 ## Advanced / experimental commands
 

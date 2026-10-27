@@ -16,6 +16,7 @@ import {
   getPattern,
   getPatternApplicability,
   listFindings,
+  normalizeCheck,
   normalizeOrigin,
   promoteFinding,
   removePattern,
@@ -85,6 +86,32 @@ test("a pattern with a check is mechanical and one without is judgment", () => {
   assert.equal(judgmentPattern(state).kind, "judgment");
   assert.equal(getPattern(state, "supabase-rls-off").id, "P001");
   assert.equal(getPattern(state, "P002").key, "unchecked-webhook-origin");
+});
+
+test("explicit error exit codes survive saving schema 3 and can be cleared", (t) => {
+  const { state } = setup();
+  const pattern = mechanicalPattern(state, {
+    check: { argv: ["grep", "needle", "target.txt"], expect: "exit-nonzero", errorExitCodes: [2] }
+  });
+  const file = stateFile(t);
+  saveState(state, file);
+  const reloaded = loadState(file);
+  assert.equal(reloaded.schemaVersion, 3);
+  assert.equal(reloaded.migratedFrom, undefined);
+  assert.deepEqual(getPattern(reloaded, pattern.key).check.errorExitCodes, [2]);
+
+  setPattern(reloaded, pattern.key, { check: { ...pattern.check, errorExitCodes: [] } });
+  saveState(reloaded, file);
+  assert.equal(getPattern(loadState(file), pattern.key).check.errorExitCodes, undefined);
+});
+
+test("error exit code policy rejects malformed values and keeps legacy checks unchanged", () => {
+  const legacy = normalizeCheck({ argv: ["node", "check.mjs"] });
+  assert.equal(Object.hasOwn(legacy, "errorExitCodes"), false);
+  for (const errorExitCodes of ["2", ["2"], [0], [-1], [256], [1.5], [NaN], [null]]) {
+    assert.throws(() => normalizeCheck({ ...legacy, errorExitCodes }), /errorExitCodes must be an array of integers/);
+  }
+  assert.deepEqual(normalizeCheck({ ...legacy, errorExitCodes: [255, 2, 2] }).errorExitCodes, [2, 255]);
 });
 
 test("only the three documented origin forms are accepted", () => {

@@ -12,6 +12,11 @@ const SESSION_AGENTS = new Set(AGENT_IDS);
 const CODE_AGENTS = new Set(CODE_AGENT_IDS);
 const ACTIVE_STATUS = "active";
 
+const PRODUCTION_TIME_SOURCE = Object.freeze({
+  testOnly: false,
+  read: () => new Date()
+});
+
 function asDate(value) {
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) throw new Error(`Invalid session timestamp: ${value}`);
@@ -41,6 +46,58 @@ function session(project, sessionId) {
   const item = project.sessions.find((entry) => entry.id === id);
   if (!item) throw new Error(`Session not found: ${sessionId}`);
   return item;
+}
+
+function sessionLeaseError(message) {
+  const error = new Error(message);
+  error.code = "SESSION_LEASE_INVALID";
+  return error;
+}
+
+function claimMatchesSession(claim, record) {
+  return claim?.sessionId === record.id
+    && claim?.owner === record.owner
+    && claim?.agent === record.agent;
+}
+
+function currentTime(options, timeSource) {
+  const value = timeSource.testOnly && options?.now !== undefined
+    ? options.now
+    : timeSource.read();
+  return asDate(value);
+}
+
+function leaseTime(options, timeSource) {
+  const current = currentTime(options, timeSource);
+  if (options?.minimumNow === undefined) return current;
+  const minimum = asDate(options.minimumNow);
+  return current.getTime() >= minimum.getTime() ? current : minimum;
+}
+
+function validateSessionLeaseWithClock(project, sessionId, options = {}, timeSource = PRODUCTION_TIME_SOURCE) {
+  const current = leaseTime(options, timeSource);
+  const record = session(project, sessionId);
+  if (record.status !== ACTIVE_STATUS) {
+    throw sessionLeaseError(`Session ${record.id} is ${record.status}; results can only be ingested into an active session.`);
+  }
+
+  const item = criterion(project, record.scopeId);
+  const claim = item.claim;
+  const expectedSessionId = options.expectedSessionId === undefined ? record.id : String(options.expectedSessionId).toUpperCase();
+  const expectedOwner = options.expectedOwner === undefined ? record.owner : options.expectedOwner;
+  const expectedAgent = options.expectedAgent === undefined ? record.agent : options.expectedAgent;
+  const expectedIdentityMatches = record.id === expectedSessionId
+    && record.owner === expectedOwner
+    && record.agent === expectedAgent;
+  if (!expectedIdentityMatches || !claimMatchesSession(claim, record) || !getActiveClaim(item, { now: current })) {
+    throw sessionLeaseError(`Session ${record.id} does not own an active lease; renew or restart it before ingesting results.`);
+  }
+
+  return { session: record, criterion: item, claim, now: current };
+}
+
+export function validateSessionLease(project, sessionId, options = {}) {
+  return validateSessionLeaseWithClock(project, sessionId, options, PRODUCTION_TIME_SOURCE);
 }
 
 function nextSessionId(project) {
@@ -163,7 +220,7 @@ function releaseOwnClaim(project, item, sessionId, now) {
   return releaseScopeClaim(project, item.id, { now });
 }
 
-export function startSession(project, scopeId, {
+function startSessionWithClock(project, scopeId, {
   agent,
   owner = null,
   ttlMinutes = 120,
@@ -171,10 +228,10 @@ export function startSession(project, scopeId, {
   worktreeRoot = undefined,
   branch = null,
   baseRef = "HEAD",
-  now = new Date()
-} = {}) {
+  now = undefined
+} = {}, timeSource = PRODUCTION_TIME_SOURCE) {
   ensureProjectShape(project);
-  const current = asDate(now);
+  const current = currentTime({ now }, timeSource);
   const item = criterion(project, scopeId);
   const routeItem = getRoutePlan(project, { limit: 200 }).find((entry) => entry.scopeId === item.id);
   const routedAgent = routeItem?.agent || null;
@@ -244,18 +301,20 @@ export function startSession(project, scopeId, {
   return { session: record, criterion: item, claim: claimOutcome.claim };
 }
 
-export function renewSession(project, sessionId, { ttlMinutes = null, now = new Date() } = {}) {
-  const current = asDate(now);
+export function startSession(project, scopeId, options = {}) {
+  return startSessionWithClock(project, scopeId, options, PRODUCTION_TIME_SOURCE);
+}
+
+function renewSessionWithClock(project, sessionId, { ttlMinutes = null, now = undefined } = {}, timeSource = PRODUCTION_TIME_SOURCE) {
+  const current = currentTime({ now }, timeSource);
   const record = session(project, sessionId);
   if (record.status !== ACTIVE_STATUS) throw new Error(`Session ${record.id} is ${record.status}; only active sessions can be renewed.`);
   const item = criterion(project, record.scopeId);
+  const claim = item.claim;
+  if (!claimMatchesSession(claim, record)) {
+    throw new Error(`${item.id} is not owned by session ${record.id}; cannot renew it.`);
+  }
   const activeClaim = getActiveClaim(item, { now: current });
-  if (activeClaim && activeClaim.sessionId && activeClaim.sessionId !== record.id) {
-    throw new Error(`${item.id} is now claimed by another session: ${activeClaim.sessionId}.`);
-  }
-  if (activeClaim && !activeClaim.sessionId && activeClaim.owner !== record.owner) {
-    throw new Error(`${item.id} is now claimed by ${activeClaim.owner || activeClaim.agent}; cannot renew ${record.id}.`);
-  }
 
   const duration = normalizeTtl(ttlMinutes ?? record.ttlMinutes ?? 120);
   const outcome = claimScopeCriterion(project, item.id, {
@@ -272,8 +331,12 @@ export function renewSession(project, sessionId, { ttlMinutes = null, now = new 
   return { session: record, criterion: item, claim: outcome.claim };
 }
 
-function endSession(project, sessionId, status, { now = new Date() } = {}) {
-  const current = asDate(now);
+export function renewSession(project, sessionId, options = {}) {
+  return renewSessionWithClock(project, sessionId, options, PRODUCTION_TIME_SOURCE);
+}
+
+function endSession(project, sessionId, status, { now = undefined } = {}, timeSource = PRODUCTION_TIME_SOURCE) {
+  const current = currentTime({ now }, timeSource);
   const record = session(project, sessionId);
   if (record.status !== ACTIVE_STATUS) throw new Error(`Session ${record.id} is already ${record.status}.`);
   const item = criterion(project, record.scopeId);
@@ -285,11 +348,18 @@ function endSession(project, sessionId, status, { now = new Date() } = {}) {
   return { session: record, criterion: item, released };
 }
 
-export function ingestSessionResult(project, sessionId, text, { apply = false, finish = false, now = new Date() } = {}) {
-  const record = session(project, sessionId);
-  if (record.status !== ACTIVE_STATUS) {
-    throw new Error(`Session ${record.id} is ${record.status}; results can only be ingested into an active session.`);
-  }
+function ingestSessionResultWithClock(project, sessionId, text, {
+  apply = false,
+  finish = false,
+  now = undefined,
+  minimumNow = undefined,
+  expectedSessionId = undefined,
+  expectedOwner = undefined,
+  expectedAgent = undefined
+} = {}, timeSource = PRODUCTION_TIME_SOURCE) {
+  const { session: record } = validateSessionLeaseWithClock(project, sessionId, {
+    now, minimumNow, expectedSessionId, expectedOwner, expectedAgent
+  }, timeSource);
   const analysis = analyzeAgentResult(project, record.scopeId, text, { agent: record.agent });
   const result = recordAgentResult(project, analysis);
   result.sessionId = record.id;
@@ -299,14 +369,18 @@ export function ingestSessionResult(project, sessionId, text, { apply = false, f
     applied = applyAgentResult(project, analysis);
     result.appliedChanges = applied.appliedChanges.map((item) => ({ ...item }));
     result.addedCriteria = applied.addedCriteria.map((item) => ({ ...item }));
-    result.appliedAt = asDate(now).toISOString();
+    result.appliedAt = currentTime({ now }, timeSource).toISOString();
   }
 
   // Applying a done/cancelled transition closes the session via domain state.
   // --finish is for reviewed work that should release the lease even when the gate stays open.
-  if (finish && record.status === ACTIVE_STATUS) finishSession(project, record.id, { now });
+  if (finish && record.status === ACTIVE_STATUS) endSession(project, record.id, "completed", { now }, timeSource);
   touch(project);
   return { session: record, analysis, result, applied };
+}
+
+export function ingestSessionResult(project, sessionId, text, options = {}) {
+  return ingestSessionResultWithClock(project, sessionId, text, options, PRODUCTION_TIME_SOURCE);
 }
 
 export function formatSessionResult(project, outcome, { applied = false } = {}) {
@@ -328,12 +402,20 @@ export function formatSessionResult(project, outcome, { applied = false } = {}) 
   return lines.join("\n");
 }
 
+function finishSessionWithClock(project, sessionId, options = {}, timeSource = PRODUCTION_TIME_SOURCE) {
+  return endSession(project, sessionId, "completed", options, timeSource);
+}
+
 export function finishSession(project, sessionId, options = {}) {
-  return endSession(project, sessionId, "completed", options);
+  return finishSessionWithClock(project, sessionId, options, PRODUCTION_TIME_SOURCE);
+}
+
+function abandonSessionWithClock(project, sessionId, options = {}, timeSource = PRODUCTION_TIME_SOURCE) {
+  return endSession(project, sessionId, "abandoned", options, timeSource);
 }
 
 export function abandonSession(project, sessionId, options = {}) {
-  return endSession(project, sessionId, "abandoned", options);
+  return abandonSessionWithClock(project, sessionId, options, PRODUCTION_TIME_SOURCE);
 }
 
 export function cleanupSessionWorkspace(project, sessionId, { now = new Date() } = {}) {
@@ -510,9 +592,8 @@ export function listSessions(projects, { projectId = null, includeEnded = false,
   return rows;
 }
 
-export function buildSessionPrompt(project, sessionId) {
-  const record = session(project, sessionId);
-  if (record.status !== ACTIVE_STATUS) throw new Error(`Session ${record.id} is ${record.status}; only active sessions can generate execution prompts.`);
+function buildSessionPromptWithClock(project, sessionId, { now = undefined } = {}, timeSource = PRODUCTION_TIME_SOURCE) {
+  const { session: record } = validateSessionLeaseWithClock(project, sessionId, { now }, timeSource);
   const item = getRoutePlan(project, { limit: 50 }).find((entry) => entry.scopeId === record.scopeId);
   if (!item) throw new Error(`No route item found for ${project.id}:${record.scopeId}.`);
   const ownedItem = {
@@ -538,6 +619,32 @@ export function buildSessionPrompt(project, sessionId) {
         "Isolation: this session does not own a separate worktree. Do not perform repository writes unless the assignment explicitly requires them."
       ];
   return `${base}\n\n## Execution session\n${workspaceLines.map((line) => `- ${line}`).join("\n")}\n- Include the session ID in your completion response.\n`;
+}
+
+export function buildSessionPrompt(project, sessionId, options = {}) {
+  return buildSessionPromptWithClock(project, sessionId, options, PRODUCTION_TIME_SOURCE);
+}
+
+function makeTestTimeSource(clock) {
+  if (typeof clock !== "function") throw new TypeError("Session test clock must be a function.");
+  return Object.freeze({ testOnly: true, read: clock });
+}
+
+// This context is intentionally separate from the production exports. It exists
+// only so deterministic unit tests can use the same implementation without
+// making caller-supplied timestamps part of the production security boundary.
+export function createSessionTestContext(clock = () => new Date()) {
+  const timeSource = makeTestTimeSource(clock);
+  return Object.freeze({
+    clock: timeSource,
+    validateSessionLease: (project, sessionId, options = {}) => validateSessionLeaseWithClock(project, sessionId, options, timeSource),
+    startSession: (project, scopeId, options = {}) => startSessionWithClock(project, scopeId, options, timeSource),
+    renewSession: (project, sessionId, options = {}) => renewSessionWithClock(project, sessionId, options, timeSource),
+    buildSessionPrompt: (project, sessionId, options = {}) => buildSessionPromptWithClock(project, sessionId, options, timeSource),
+    ingestSessionResult: (project, sessionId, text, options = {}) => ingestSessionResultWithClock(project, sessionId, text, options, timeSource),
+    finishSession: (project, sessionId, options = {}) => finishSessionWithClock(project, sessionId, options, timeSource),
+    abandonSession: (project, sessionId, options = {}) => abandonSessionWithClock(project, sessionId, options, timeSource)
+  });
 }
 
 function workspaceLabel(record) {

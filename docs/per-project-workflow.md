@@ -130,7 +130,7 @@ Or use a file/text argument:
 sumi result musubu C001 --agent codex --file .\result.txt --apply
 ```
 
-SUMI extracts evidence, blockers, and conservative Scope transitions. Explicit agent verdicts are preferred over weaker heuristics; for example, `mergeable` does not automatically close a gate if the reviewer explicitly says it must remain open.
+SUMI extracts evidence, blockers, and conservative Scope transitions. Write verdicts with their full Scope IDs: `C001 can move to done. C002 stays blocked. C003 stays open.` Statements naming another Scope do not supply the target’s disposition. Unscoped warnings and explicit `BLOCKER:` declarations remain conservative overrides; qualify contextual status descriptions with the relevant ID. Explicit agent verdicts are preferred over weaker heuristics; for example, `mergeable` does not automatically close a gate if the reviewer explicitly says it must remain open.
 
 ## Explain why a gate has its status
 
@@ -157,7 +157,8 @@ The handoff contains:
 - current repository/branch/PR state
 - project progress basis
 - current and blocked Scope items
-- next actions
+- next actions ordered ready → claimed → waiting, with owner and waiting reason
+- absolute state-file path and a reminder to resume with `--data`
 - CI diagnostics
 - recent merged PRs
 - recent decisions/results

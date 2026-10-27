@@ -1,7 +1,8 @@
 import { touch } from "./domain.js";
 import { MERGE_STATUSES, getMergeReadiness } from "./merge.js";
 import { getSession } from "./sessions.js";
-import { commandExists, mapChecks, runCommand, summarizeChecks } from "./sync.js";
+import { createGithubApi, deriveReviewDecision, getCommitChecks, getPull, listPullReviews, listPullsForBranch, mergeableLabel, pullState } from "./github.js";
+import { commandExists, mapChecks, summarizeChecks } from "./sync.js";
 
 export const RELEASE_STATUSES = {
   READY: "RELEASE_READY",
@@ -104,7 +105,50 @@ function selectPr(list, branch, headSha) {
     || null;
 }
 
-export function syncReleaseEvidence(project, sessionId, { now = new Date() } = {}) {
+/** A REST pull request in the shape `gh pr list --json ...` returned. */
+function shapePull(pr) {
+  return {
+    number: pr.number,
+    title: pr.title ?? null,
+    url: pr.html_url ?? null,
+    state: pullState(pr),
+    isDraft: Boolean(pr.draft),
+    headRefName: pr.head?.ref ?? null,
+    baseRefName: pr.base?.ref ?? null,
+    headRefOid: pr.head?.sha ?? null,
+    mergeable: "UNKNOWN",
+    mergeStateStatus: "UNKNOWN",
+    reviewDecision: null,
+    statusCheckRollup: [],
+    latestReviews: [],
+    reviewRequests: [
+      ...(pr.requested_reviewers || []).map((user) => ({ login: user?.login })),
+      ...(pr.requested_teams || []).map((team) => ({ slug: team?.slug }))
+    ]
+  };
+}
+
+function latestReviewsOf(reviews) {
+  const latest = new Map();
+  for (const review of reviews) {
+    const state = String(review?.state || "").toUpperCase();
+    if (!state || state === "PENDING") continue;
+    const login = review.user?.login || null;
+    const key = login || `#${review.id}`;
+    const at = Date.parse(review.submitted_at || "") || 0;
+    const previous = latest.get(key);
+    if (!previous || at >= previous.at) latest.set(key, { at, review: { state, author: { login }, submittedAt: review.submitted_at || null } });
+  }
+  return [...latest.values()].map((entry) => entry.review);
+}
+
+/**
+ * Read the session branch's PR over REST (`gh api`): the PR list for the
+ * branch, then for the selected PR its mergeability, reviews and the checks
+ * on its head commit. Any read that fails fails the whole sync — a release
+ * decision is never made from part of the evidence.
+ */
+export function syncReleaseEvidence(project, sessionId, { now = new Date(), githubApi = null } = {}) {
   const record = getSession(project, sessionId);
   const merge = getMergeReadiness(project, sessionId);
   const observedAt = asDate(now).toISOString();
@@ -114,10 +158,15 @@ export function syncReleaseEvidence(project, sessionId, { now = new Date() } = {
     sessionId: record.id,
     branch: record.workspace?.branch || null,
     expectedHead: merge.head || record.lastReview?.workspace?.head || null,
-    source: "gh",
+    source: "gh-api",
     ok: false,
     error: null,
     pr: null
+  };
+  const fail = (error) => {
+    record.releaseEvidence = { ...base, error };
+    touch(project);
+    return record.releaseEvidence;
   };
 
   if (!project.repo) {
@@ -130,37 +179,48 @@ export function syncReleaseEvidence(project, sessionId, { now = new Date() } = {
     touch(project);
     return record.releaseEvidence;
   }
-  if (!commandExists("gh")) {
-    record.releaseEvidence = { ...base, error: "GitHub CLI (gh) is not installed or not resolvable." };
-    touch(project);
-    return record.releaseEvidence;
-  }
+  if (!githubApi && !commandExists("gh")) return fail("GitHub CLI (gh) is not installed or not resolvable.");
+  const api = githubApi || createGithubApi();
 
-  const fields = [
-    "number", "title", "url", "state", "isDraft", "headRefName", "baseRefName", "headRefOid",
-    "mergeable", "mergeStateStatus", "reviewDecision", "statusCheckRollup", "latestReviews", "reviewRequests"
-  ].join(",");
-  const result = runCommand("gh", [
-    "pr", "list", "--repo", project.repo, "--state", "all", "--head", record.workspace.branch,
-    "--limit", "10", "--json", fields
-  ], { cwd: record.workspace.path || project.local || undefined, timeout: 30000 });
-
-  if (!result.ok) {
-    record.releaseEvidence = { ...base, error: result.stderr || result.error || "GitHub PR lookup failed." };
-    touch(project);
-    return record.releaseEvidence;
-  }
-
+  let listed;
   try {
-    const list = JSON.parse(result.stdout || "[]");
-    record.releaseEvidence = {
-      ...base,
-      ok: true,
-      pr: selectPr(list, record.workspace.branch, base.expectedHead)
-    };
-  } catch {
-    record.releaseEvidence = { ...base, error: "GitHub CLI returned unreadable PR JSON." };
+    listed = listPullsForBranch(api, project.repo, record.workspace.branch);
+  } catch (error) {
+    return fail(error.message);
   }
+  if (!listed.ok) return fail(listed.error || "GitHub PR lookup failed.");
+
+  const shaped = listed.data.map(shapePull);
+  const chosen = selectPr(shaped, record.workspace.branch, base.expectedHead);
+  if (!chosen) {
+    record.releaseEvidence = { ...base, ok: true, pr: null };
+    touch(project);
+    return record.releaseEvidence;
+  }
+  const raw = shaped.find((pr) => Number(pr.number) === chosen.number);
+
+  const detail = getPull(api, project.repo, chosen.number);
+  if (!detail.ok) return fail(detail.error || `GitHub PR #${chosen.number} lookup failed.`);
+  const reviews = listPullReviews(api, project.repo, chosen.number);
+  if (!reviews.ok) return fail(reviews.error || `GitHub reviews for PR #${chosen.number} could not be read.`);
+  let checks = { ok: true, data: [] };
+  if (raw.headRefOid) {
+    checks = getCommitChecks(api, project.repo, raw.headRefOid);
+    if (!checks.ok) return fail(checks.error || `GitHub checks for PR #${chosen.number} could not be read.`);
+  }
+
+  // The PR detail is newer than the list entry: take state and head from it.
+  const full = {
+    ...raw,
+    ...shapePull(detail.data),
+    mergeable: mergeableLabel(detail.data.mergeable),
+    mergeStateStatus: String(detail.data.mergeable_state || "unknown").toUpperCase(),
+    reviewDecision: deriveReviewDecision(reviews.data),
+    latestReviews: latestReviewsOf(reviews.data),
+    statusCheckRollup: detail.data.head?.sha && detail.data.head.sha !== raw.headRefOid ? null : checks.data
+  };
+  if (full.statusCheckRollup === null) return fail(`PR #${chosen.number} moved while it was being read; sync again.`);
+  record.releaseEvidence = { ...base, ok: true, pr: normalizeReleasePr(full) };
   touch(project);
   return record.releaseEvidence;
 }
